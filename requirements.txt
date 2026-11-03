@@ -1,0 +1,10 @@
+# ARM64 (aarch64) wheels exist for all of these; install a CUDA-enabled torch build for the GPU.
+torch>=2.4
+transformers>=4.56,<6   # tested with 5.22.1
+tokenizers>=0.20
+huggingface_hub>=0.25
+safetensors>=0.4
+datasets>=2.20
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
