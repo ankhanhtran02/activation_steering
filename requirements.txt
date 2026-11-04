@@ -1,4 +1,6 @@
 # ARM64 (aarch64) wheels exist for all of these; install a CUDA-enabled torch build for the GPU.
+# Ranges only: run.sh writes requirements.lock (exact versions) on first setup and installs from it afterwards.
+# Optional, for `python audit.py judge --backend anthropic` only: anthropic
 torch>=2.4
 transformers>=4.56,<6   # tested with 5.22.1
 tokenizers>=0.20

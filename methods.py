@@ -1,27 +1,40 @@
-"""Proposed steering methods: knowledge (D_ku), within-question (D_wq), safety-refusal direction,
-and margin-gated steering. All add alpha * v_hat at the residual stream after block L_star."""
+"""Proposed steering methods: knowledge (D_ku), read (D_read, amendment A9), within-question (D_wq),
+safety-refusal direction, margin-gated steering and the dose-matched nulls (amendment A9).
+
+Strength (amendment A11): a dev-sweep configuration (L, c) of direction v adds c * sigma_L(v) * v_hat,
+sigma_L(v) = SD of the unsteered last-prompt residual's projection on v_hat over PopQA train. The
+frozen shared site adds the absolute norm alpha* = c* sigma_{L*}(D_ku) for every primary direction and
+for the norm-matched random draws (norm matching as registered); dose-ladder rungs add
+c * sigma_{L*}(D_ku) for every direction, so magnitudes stay crossed with direction source.
+"""
 import numpy as np
 import torch
 
 import model_utils as mu
-from config import (C_GRID, DEV_ELIGIBLE_ABST_INC, DEV_ELIGIBLE_MAX_DEGENERATE,
-                    DEV_FALLBACK_TARGET_INC, DEV_TIE_POINTS, INSTR_MAX_NEW_TOKENS,
-                    MIN_CLASS_KNOWN_UNKNOWN)
+from config import (C_GRID, DEV_ELIGIBLE_ABST_INC, DEV_ELIGIBLE_MAX_DEGENERATE, DEV_FALLBACK_TARGET_INC,
+                    DEV_TIE_POINTS, INSTR_MAX_NEW_TOKENS, MIN_CLASS_KNOWN_UNKNOWN, MMLU_CAP_POINTS, PPL_CAP_RATIO)
 from scoring import A_, C_, W_, CondOutput, is_instruction_refusal, summary_metrics
-from steering import (Intervention, SteeredQA, between_question_direction, diff_of_means,
-                      permute_labels_within_question, steer, unit, within_question_direction)
+from steering import (Intervention, SteeredQA, between_question_direction, bootstrap_questions,
+                      covariance_shaped_direction, diff_of_means, permute_labels_within_question,
+                      shuffled_label_direction, steer, unit, within_question_direction)
 
 
 class _DirectionSteer(SteeredQA):
-    """Shared: intervention at (layer, c) with alpha = c * rbar_L and a per-layer unit direction."""
+    """Shared: intervention at the frozen site (absolute alpha*), at a dose-ladder rung
+    (c * sigma_{L*}(D_ku)), or at a dev-sweep configuration (c * sigma_L(v))."""
     key = None
 
-    def intervention(self, layer=None, c=None, positions="both", direction=None, name=None):
+    def intervention(self, layer=None, c=None, positions="both", direction=None, name=None, alpha=None):
         f = self.ctx.frozen
         L = f["L_star"] if layer is None else layer
-        c = f["c_star"] if c is None else c
         v = self.ctx.dirs[self.key][L] if direction is None else direction
-        return steer(name or f"{self.key}_l{L}_c{c:g}", L, v, c * float(self.ctx.rbar[L]), positions)
+        if alpha is None:
+            if c is None:
+                assert layer is None, "a non-shared layer needs an explicit c"
+                alpha, c = f["alpha"], f["c_star"]
+            else:
+                alpha = self.ctx.site_alpha(c, L)
+        return steer(name or f"{self.key}_l{L}_c{c:g}", L, v, alpha, positions)
 
     @staticmethod
     def score(out):
@@ -52,22 +65,46 @@ class KnowledgeDirectionSteer(_DirectionSteer):
         return {L: unit(diff_of_means(R[:, L], unknown, known)) for L in layers}
 
     @staticmethod
-    def select_config_on_dev(sweep, layers):
-        """sweep: {(L, c): {"S1", "degenerate_rate", "abst_increase"}}. Pre-registered rule."""
+    def select_config_on_dev(sweep, layers, caps=None):
+        """sweep: {(L, c): {"S1", "degenerate_rate", "abst_increase"}}. Pre-registered rule plus the
+        amendment-A11 caps: caps(L, c) -> {"mmlu_delta": points, "ppl_ratio": ratio}, evaluated only
+        for configurations that pass the registered criteria (results cached in the sweep)."""
         middle = layers[len(layers) // 2]
-        eligible = {k: v for k, v in sweep.items()
-                    if v["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE
-                    and DEV_ELIGIBLE_ABST_INC[0] <= v["abst_increase"] <= DEV_ELIGIBLE_ABST_INC[1]}
+
+        def cap_ok(k):
+            if caps is None:
+                return True
+            if "caps" not in sweep[k]:
+                sweep[k]["caps"] = caps(*k)
+            cp = sweep[k]["caps"]
+            cp["passed"] = bool(cp["mmlu_delta"] >= MMLU_CAP_POINTS and cp["ppl_ratio"] <= PPL_CAP_RATIO)
+            return cp["passed"]
+
+        clean = [k for k, v in sweep.items() if v["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE]
+        window = [k for k in clean if DEV_ELIGIBLE_ABST_INC[0] <= sweep[k]["abst_increase"] <= DEV_ELIGIBLE_ABST_INC[1]]
+        eligible = [k for k in sorted(window, key=lambda k: -sweep[k]["S1"]) if cap_ok(k)]
         if eligible:
-            best = max(v["S1"] for v in eligible.values())
-            tied = [k for k, v in eligible.items() if v["S1"] >= best - DEV_TIE_POINTS]
+            best = max(sweep[k]["S1"] for k in eligible)
+            tied = [k for k in eligible if sweep[k]["S1"] >= best - DEV_TIE_POINTS]
             L, c = sorted(tied, key=lambda k: (k[1], k[0] != middle, -sweep[k]["S1"]))[0]
             return L, c, "eligible"
-        clean = {k: v for k, v in sweep.items() if v["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE}
-        if clean:
-            L, c = min(clean, key=lambda k: (abs(clean[k]["abst_increase"] - DEV_FALLBACK_TARGET_INC), k[1]))
-            return L, c, "fallback_closest_to_15"
+        for k in sorted(clean, key=lambda k: (abs(sweep[k]["abst_increase"] - DEV_FALLBACK_TARGET_INC), k[1])):
+            if cap_ok(k):
+                return k[0], k[1], "fallback_closest_to_15"
         return middle, C_GRID[0], "no clean operating point"
+
+
+class ReadDirectionSteer(_DirectionSteer):
+    """Amendment A9, D_read: D_ku fitted on answered train items only, mean(last-prompt residual |
+    unsteered wrong) - mean(... | unsteered correct), sign + (toward wrong, i.e. toward abstention as
+    for D_ku). Same site and norm as knowledge_dir_steer."""
+    key = "read"
+
+    def fit_direction(self, layers):
+        c = self.ctx
+        g = c.uout["train"].states
+        R = c.cache["train"]["resid_last"]
+        return {L: unit(diff_of_means(R[:, L], g == W_, g == C_)) for L in layers}
 
 
 class WithinQuestionDirectionSteer(_DirectionSteer):
@@ -117,6 +154,13 @@ class WithinQuestionDirectionSteer(_DirectionSteer):
         return {L: unit(within_question_direction(H[:, j], qidx, labels)) for L, j in layer_positions.items()}
 
     @staticmethod
+    def fit_refit(H, qidx, labels, layer_positions, seed):
+        """Amendment A8 refit r >= 1: question-level bootstrap of the gray zone."""
+        rows, newq = bootstrap_questions(qidx, seed)
+        Hr = H[torch.as_tensor(rows)]
+        return {L: unit(within_question_direction(Hr[:, j], newq, labels[rows])) for L, j in layer_positions.items()}
+
+    @staticmethod
     def fit_between_question(H, labels, layer_positions):
         return {L: unit(between_question_direction(H[:, j], labels)) for L, j in layer_positions.items()}
 
@@ -124,6 +168,10 @@ class WithinQuestionDirectionSteer(_DirectionSteer):
     def fit_label_permuted(H, qidx, labels, layer_positions, seed):
         perm = permute_labels_within_question(qidx, labels, seed)
         return {L: unit(within_question_direction(H[:, j], qidx, perm)) for L, j in layer_positions.items()}
+
+    def answer_position_intervention(self, L, alpha, direction, name):
+        """Amendment A9: D_wq added where it was measured, at the generated (answer) positions only."""
+        return steer(name, L, direction, alpha, "generated_only")
 
     def same_signal_projection(self, split):
         """Unsteered greedy answer's mean answer-token residual at L_star projected on D_hat_wq
@@ -141,10 +189,20 @@ class RefusalDirectionSteer(_DirectionSteer):
     def instruction_prompts(self, instructions):
         return [self.ctx.fmt.prompt(x) for x in instructions]
 
-    def fit_direction(self, layers):
+    def train_residuals(self, layers):
         c = self.ctx
         harm = mu.prompt_last_residuals(c.model, c.fmt, self.instruction_prompts(c.data["instr"]["adv_train"]), layers)
         safe = mu.prompt_last_residuals(c.model, c.fmt, self.instruction_prompts(c.data["instr"]["alpaca_train"]), layers)
+        return harm, safe
+
+    @staticmethod
+    def fit_from_residuals(harm, safe, layers, seed=0):
+        """Seed 0: all 128 + 128 instructions (registered). Seed s >= 1 (amendment A8): a bootstrap
+        resample of each class."""
+        if seed:
+            rng = np.random.default_rng(9000 + seed)
+            harm = harm[torch.as_tensor(rng.integers(0, len(harm), len(harm)))]
+            safe = safe[torch.as_tensor(rng.integers(0, len(safe), len(safe)))]
         return {L: unit(harm[:, j].mean(0) - safe[:, j].mean(0)) for j, L in enumerate(layers)}
 
     def refusal_rate(self, iv, instructions):
@@ -152,13 +210,22 @@ class RefusalDirectionSteer(_DirectionSteer):
         flags = np.array([is_instruction_refusal(t) for t in gen.texts])
         return float(flags.mean()), gen.texts, flags
 
-    def positive_control(self, layers, unsteered_rate):
-        """Ablate r_hat_L everywhere for each candidate layer; L_ref = largest relative reduction of
+    def ablation_intervention(self, name, L_ref, mode="directional", layers="all", means=None):
+        """Amendment A12 variants. directional/all = registered arm; mean/all and mean/single replace
+        the component along r_hat with its harmless-reference mean (everywhere / at L_ref only)."""
+        r = self.ctx.dirs["refusal"][L_ref]
+        return Intervention(name, ablate=r, ablate_mode=mode,
+                            ablate_layers=None if layers == "all" else [L_ref], ablate_means=means)
+
+    def positive_control(self, layers, unsteered_rate, mode="directional", scope="all", means_by_layer=None):
+        """Ablate r_hat_L (variant) for each candidate layer; L_ref = largest relative reduction of
         refusal on the 100 held-out AdvBench prompts; pass if >= 50%."""
         held = self.ctx.data["instr"]["adv_heldout"]
         per_layer = {}
         for L in layers:
-            rate, _, _ = self.refusal_rate(Intervention(f"refusal_ablate_l{L}", ablate=self.ctx.dirs["refusal"][L]), held)
+            iv = self.ablation_intervention(f"refusal_ablate_{mode}_{scope}_l{L}", L, mode, scope,
+                                            None if means_by_layer is None else means_by_layer[L])
+            rate, _, _ = self.refusal_rate(iv, held)
             per_layer[L] = {"refusal_rate": rate,
                             "relative_reduction": (unsteered_rate - rate) / unsteered_rate if unsteered_rate > 0 else float("nan")}
         L_ref = max(layers, key=lambda L: np.nan_to_num(per_layer[L]["relative_reduction"], nan=-1.0))
@@ -168,6 +235,21 @@ class RefusalDirectionSteer(_DirectionSteer):
         """Last-prompt residual at L_star projected on r_hat (high = refusal-like)."""
         L = self.ctx.frozen["L_star"]
         return (self.ctx.cache[split]["resid_last"][:, L] @ self.ctx.dirs["refusal"][L]).numpy()
+
+
+class DoseMatchedNull:
+    """Amendment A9: three nulls per seed at the shared layer and positions, each with its strength
+    (a multiple of alpha*) chosen on the dev subset to match knowledge_dir_steer's dev abstention
+    increase: shuffled-label D_ku, covariance-shaped random (z ~ N(0, Sigma_{L*})) and negated D_ku."""
+
+    @staticmethod
+    def directions(ctx, seed):
+        L = ctx.frozen["L_star"]
+        R = ctx.cache["train"]["resid_last"][:, L]
+        known, unknown = ctx.extras["known_unknown_masks"]
+        return {"shuffled_ku": shuffled_label_direction(R, unknown, known, 7000 + 10 * seed),
+                "cov_random": covariance_shaped_direction(R, 7001 + 10 * seed),
+                "negated_ku": -ctx.dirs["knowledge"][L]}
 
 
 class MarginGatedSteer:

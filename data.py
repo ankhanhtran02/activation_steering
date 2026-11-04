@@ -1,4 +1,5 @@
-"""Dataset loading, subject-disjoint splits, popularity bins and gold aliases."""
+"""Dataset loading, subject-disjoint splits, popularity bins, gold aliases, seed redraws and data
+checksums."""
 import hashlib
 import json
 import os
@@ -6,9 +7,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from config import (DATA_DIR, DEV_SUBSET_PER_DECILE, EQ_PER_RELATION, EQ_RELATIONS, N_ADV_HELDOUT,
-                    N_ADV_TRAIN, N_ALPACA_BENIGN, N_ALPACA_PPL, N_ALPACA_TRAIN, N_MMLU,
-                    N_PER_DECILE, SPLIT_FRACTIONS, SPLIT_SALT)
+from config import (DATA_DIR, DATA_FILES, DEV_SUBSET_PER_DECILE, EQ_PER_RELATION, EQ_RELATIONS, N_ADV_HELDOUT,
+                    N_ADV_TRAIN, N_ALPACA_BENIGN, N_ALPACA_TRAIN, N_MMLU, N_MMLU_DEV, N_PER_DECILE, N_REF_DEV,
+                    N_REF_TEST, REF_MIN_CHARS, SEED_SPLIT_BASE, SPLIT_FRACTIONS, SPLIT_SALT, TQA_DEV_N, TQA_TEST_N)
 
 
 @dataclass
@@ -16,7 +17,7 @@ class QAItem:
     qid: str
     question: str
     aliases: list
-    dataset: str                     # "popqa" or "eq"
+    dataset: str                     # "popqa", "eq" or "tqa"
     subj: str = ""
     subj_id: int = -1
     prop: str = ""                   # PopQA property or EntityQuestions relation
@@ -38,6 +39,30 @@ def read_jsonl(name):
         return [json.loads(line) for line in f]
 
 
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def verify_data_checksums(manifest):
+    """Compares every data_cache file with the sha256 setup.py recorded (amendment A14). Returns
+    {key: (status, recorded, actual)}; status in ok / mismatch / unrecorded / missing."""
+    recorded = manifest.get("datasets", {})
+    out = {}
+    for key, fname in DATA_FILES.items():
+        path = DATA_DIR / fname
+        rec = recorded.get(key, {}).get("sha256")
+        if not path.exists():
+            out[key] = ("missing", rec, None)
+            continue
+        actual = file_sha256(path)
+        out[key] = ("unrecorded" if rec is None else ("ok" if rec == actual else "mismatch"), rec, actual)
+    return out
+
+
 def subject_pool(subj_id):
     h = int(hashlib.sha1((SPLIT_SALT + str(subj_id)).encode()).hexdigest(), 16) % 10_000 / 10_000
     if h < SPLIT_FRACTIONS[0]:
@@ -51,8 +76,17 @@ def _norm_words(s):
     return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in s).split())
 
 
+def _dev_subset(dev_items, seed):
+    rng_sub = np.random.default_rng(seed)
+    out = []
+    for d in range(10):
+        idx = [i for i, it in enumerate(dev_items) if it.decile == d]
+        out += [idx[i] for i in rng_sub.permutation(len(idx))[:DEV_SUBSET_PER_DECILE]]
+    return sorted(out)
+
+
 def load_popqa(test_n_per_decile):
-    rows = read_jsonl("popqa.jsonl")
+    rows = read_jsonl(DATA_FILES["popqa"])
     n_raw = len(rows)
     # a few PopQA rows have no subject ("Who is the author of ?"): unanswerable, dropped
     rows = [r for r in rows if r["subj"] and r["subj"].strip()]
@@ -96,17 +130,33 @@ def load_popqa(test_n_per_decile):
     for k in splits:  # fixed, popularity-mixed question order (batches are formed in this order)
         splits[k].sort(key=lambda it: qid_hash(it.qid))
 
-    rng_sub = np.random.default_rng(0)
-    dev_subset = []
-    for d in range(10):
-        idx = [i for i, it in enumerate(splits["dev"]) if it.decile == d]
-        dev_subset += [idx[i] for i in rng_sub.permutation(len(idx))[:DEV_SUBSET_PER_DECILE]]
+    dev_subset = _dev_subset(splits["dev"], 0)
     pool_subjects = sorted({it.subj for k in ("train", "dev") for it in items_by_pool[k]})
-    return splits, sorted(dev_subset), pool_subjects, {"shortfall": shortfall,
-                                                         "decile_edges": dec_edges.tolist(),
-                                                         "tercile_edges": ter_edges.tolist(),
-                                                         "pool_sizes": {k: len(v) for k, v in items_by_pool.items()},
-                                                         "n_dropped_no_subject": n_raw - len(rows)}
+    return splits, dev_subset, pool_subjects, items_by_pool, {
+        "shortfall": shortfall, "decile_edges": dec_edges.tolist(), "tercile_edges": ter_edges.tolist(),
+        "pool_sizes": {k: len(v) for k, v in items_by_pool.items()}, "n_dropped_no_subject": n_raw - len(rows)}
+
+
+def draw_seed_splits(pools, seed):
+    """Amendment A8: seed s >= 1 redraws train (100/decile), train_reserve (100/decile) and dev
+    (40/decile) from the same subject-disjoint pools with rng(SEED_SPLIT_BASE + s); test never
+    changes. Seed 0 is the registered draw returned by load_popqa (never produced here)."""
+    assert seed >= 1
+    rng = np.random.default_rng(SEED_SPLIT_BASE + seed)
+    out = {"train": [], "train_reserve": [], "dev": []}
+    for pool in ("train", "dev"):
+        for d in range(10):
+            cand = sorted([it for it in pools[pool] if it.decile == d], key=lambda x: x.qid)
+            perm = [cand[i] for i in rng.permutation(len(cand))]
+            if pool == "train":
+                n1, n2 = N_PER_DECILE["train"], N_PER_DECILE["train_reserve"]
+                out["train"] += perm[:n1]
+                out["train_reserve"] += perm[n1:n1 + n2]
+            else:
+                out["dev"] += perm[:N_PER_DECILE["dev"]]
+    for k in out:
+        out[k].sort(key=lambda it: qid_hash(it.qid))
+    return out, _dev_subset(out["dev"], SEED_SPLIT_BASE + seed)
 
 
 def eq_template_subject(questions):
@@ -127,7 +177,7 @@ def load_entity_questions(excluded_subjects):
     against each question's subject slot, not the template wording: PopQA contains entities
     literally named "Music", "Country", "Born" or "Capital" that would otherwise remove whole
     relations whose template contains those words."""
-    rows = read_jsonl("entity_questions_test.jsonl")
+    rows = read_jsonl(DATA_FILES["entity_questions"])
     excl = {_norm_words(s) for s in excluded_subjects if len(s.strip()) >= 4}
     excl.discard("")
     max_len = max(len(s.split()) for s in excl)
@@ -158,35 +208,68 @@ def load_entity_questions(excluded_subjects):
     return items, {"n_excluded_by_subject_filter": n_excluded}
 
 
-def eq_subset_indices(items, n_total):
+def eq_subset_indices(items, n_total, key="prop", groups=EQ_RELATIONS):
     """First k items of each relation (in sampled order); k differs by one across relations."""
-    base, extra = divmod(n_total, len(EQ_RELATIONS))
+    base, extra = divmod(n_total, len(groups))
     out = []
-    for j, rel in enumerate(EQ_RELATIONS):
-        idx = [i for i, it in enumerate(items) if it.prop == rel]
+    for j, rel in enumerate(groups):
+        idx = [i for i, it in enumerate(items) if getattr(it, key) == rel]
         out += idx[:base + (1 if j < extra else 0)]
     return sorted(out)
 
 
+def load_triviaqa():
+    """Amendment A10: TriviaQA rc.nocontext validation; dev 300 / test 1,000, disjoint (seed 0).
+    Directions are transferred from PopQA, not refit; dev is used only for the threshold tau."""
+    rows = read_jsonl(DATA_FILES["triviaqa"])
+    rows = sorted(rows, key=lambda r: r["question_id"])
+    perm = np.random.default_rng(0).permutation(len(rows))
+
+    def item(r):
+        al = [a for a in dict.fromkeys(r["aliases"] + [r["value"]]) if a and a.strip()]
+        return QAItem(qid=f"tqa_{r['question_id']}", question=r["question"], aliases=al, dataset="tqa")
+    dev = [item(rows[i]) for i in perm[:TQA_DEV_N]]
+    test = [item(rows[i]) for i in perm[TQA_DEV_N:TQA_DEV_N + TQA_TEST_N]]
+    for k in (dev, test):
+        k.sort(key=lambda it: qid_hash(it.qid))
+    return {"dev": dev, "test": test}
+
+
+def tqa_subset_indices(items, n_total):
+    """Fixed random-draw subset: the n_total items with the smallest question-id hash."""
+    order = sorted(range(len(items)), key=lambda i: qid_hash(items[i].qid))
+    return sorted(order[:n_total])
+
+
+def load_reference_text():
+    """Amendment A11: BBC News articles from May 2025 (after both models' release, so they cannot be
+    memorised) replace the Alpaca outputs as perplexity text. 200 dev (dev-selection cap) / 200 test
+    (reported side effect), disjoint, seed 0; first 128 tokens of the article body are scored."""
+    rows = read_jsonl(DATA_FILES["bbc_news"])
+    rows = [r for r in rows if r.get("content") and len(r["content"]) >= REF_MIN_CHARS and r.get("title")]
+    rows = sorted(rows, key=lambda r: r["link"])
+    perm = np.random.default_rng(0).permutation(len(rows))
+    pick = lambda i: {"title": rows[i]["title"].replace(" - BBC News", "").strip(), "text": rows[i]["content"].strip()}
+    return {"dev": [pick(i) for i in perm[:N_REF_DEV]], "test": [pick(i) for i in perm[N_REF_DEV:N_REF_DEV + N_REF_TEST]]}
+
+
 def load_instruction_sets():
-    adv = read_jsonl("advbench.jsonl")
+    adv = read_jsonl(DATA_FILES["advbench"])
     perm = np.random.default_rng(0).permutation(len(adv))
     adv_train = [adv[i]["goal"] for i in perm[:N_ADV_TRAIN]]
     adv_heldout = [adv[i]["goal"] for i in perm[N_ADV_TRAIN:N_ADV_TRAIN + N_ADV_HELDOUT]]
-    alp = read_jsonl("alpaca_noinput.jsonl")
+    alp = read_jsonl(DATA_FILES["alpaca"])
     perm = np.random.default_rng(0).permutation(len(alp))
-    a, b, c = N_ALPACA_TRAIN, N_ALPACA_TRAIN + N_ALPACA_BENIGN, N_ALPACA_TRAIN + N_ALPACA_BENIGN + N_ALPACA_PPL
+    a, b = N_ALPACA_TRAIN, N_ALPACA_TRAIN + N_ALPACA_BENIGN
     return {"adv_train": adv_train, "adv_heldout": adv_heldout,
             "alpaca_train": [alp[i]["instruction"] for i in perm[:a]],
-            "alpaca_benign": [alp[i]["instruction"] for i in perm[a:b]],
-            "alpaca_ppl": [(alp[i]["instruction"], alp[i]["output"]) for i in perm[b:c]]}
+            "alpaca_benign": [alp[i]["instruction"] for i in perm[a:b]]}
 
 
-def load_mmlu():
-    rows = read_jsonl("mmlu_test.jsonl")
+def _stratified_mmlu(rows, n, seed=0):
     subjects = sorted({r["subject"] for r in rows})
-    rng = np.random.default_rng(0)
-    base, extra = divmod(N_MMLU, len(subjects))
+    rng = np.random.default_rng(seed)
+    base, extra = divmod(n, len(subjects))
     bonus = set(rng.permutation(len(subjects))[:extra].tolist())
     out = []
     for j, s in enumerate(subjects):
@@ -196,6 +279,15 @@ def load_mmlu():
     return out
 
 
+def load_mmlu():
+    return _stratified_mmlu(read_jsonl(DATA_FILES["mmlu"]), N_MMLU)
+
+
+def load_mmlu_dev():
+    """Amendment A11: 300 questions from the MMLU validation split (disjoint from the test 500)."""
+    return _stratified_mmlu(read_jsonl(DATA_FILES["mmlu_dev"]), N_MMLU_DEV)
+
+
 def trim_test(items, n_per_decile):
     """Degradation-ladder step: keep the first n items per decile in sampling order (a prefix of
     the original draw, so the smaller test set is nested in the larger one)."""
@@ -203,9 +295,12 @@ def trim_test(items, n_per_decile):
 
 
 def load_all(test_n_per_decile=N_PER_DECILE["test"]):
-    splits, dev_subset, pool_subjects, popqa_info = load_popqa(test_n_per_decile)
+    splits, dev_subset, pool_subjects, pools, popqa_info = load_popqa(test_n_per_decile)
     eq_items, eq_info = load_entity_questions(pool_subjects)
-    return {"popqa": splits, "dev_subset": dev_subset, "eq": eq_items,
-            "instr": load_instruction_sets(), "mmlu": load_mmlu(),
+    tqa = load_triviaqa()
+    return {"popqa": splits, "dev_subset": dev_subset, "pools": pools, "eq": eq_items, "tqa": tqa,
+            "instr": load_instruction_sets(), "mmlu": load_mmlu(), "mmlu_dev": load_mmlu_dev(),
+            "ref": load_reference_text(),
             "info": {"popqa": popqa_info, "eq": eq_info,
-                     "sizes": {k: len(v) for k, v in splits.items()} | {"eq": len(eq_items)}}}
+                     "sizes": {k: len(v) for k, v in splits.items()} | {"eq": len(eq_items), "tqa_dev": len(tqa["dev"]),
+                                                                       "tqa_test": len(tqa["test"])}}}

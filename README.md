@@ -4,7 +4,11 @@ Screening-tier experiment from `experiment_plan.yaml`: *does hallucination steer
 detector?* Two frozen ~3B instruction models (Llama-3.2-3B-Instruct, Qwen2.5-3B-Instruct) are
 steered at inference time with difference-of-means directions and compared against a confidence
 threshold, a confidence prompt, a popularity gate and 20 norm-matched random directions on PopQA,
-with EntityQuestions as a transfer set. No model is trained or fine-tuned.
+with EntityQuestions and TriviaQA as transfer sets. No model is trained or fine-tuned.
+
+The protocol is `experiment_plan.yaml` as amended by `preregistration_amendment_2026-11-04.md`
+(corrected statistics, freeze-before-test ordering, seeds, added controls, pinned data). The
+changes are summarised in the "Refinement log" at the top of `main.py`.
 
 ## Quick start (one command)
 
@@ -15,18 +19,19 @@ bash run.sh
 
 That is the whole procedure. `run.sh` will:
 
-1. create a Python virtual env in `.venv/` and install the dependencies (a CUDA build of PyTorch
-   is installed only if none is found);
-2. download both models and all five datasets (`setup.py`, about 15-25 min, ~13 GB);
+1. create or reuse the Python virtual env in `.venv/` and install the dependencies only when needed
+   (see "Python environment" below; a CUDA build of PyTorch is installed only if none is found);
+2. download both models and all datasets at their pinned revisions (`setup.py`, about 15-25 min,
+   ~13 GB; files already at their pinned source are skipped);
 3. check that the GPU works in bf16 and that every file is in place;
-4. run the experiment offline (`main.py`, about 3 hours, hard limit 4 hours) and save logs and
-   results to `outputs/`.
+4. run the experiment offline (`main.py`, about 7-8 hours, hard limit 10 hours) and save logs and
+   results to a new folder `outputs/run_<UTC timestamp>/` (`outputs/latest` points to it).
 
 The run takes hours, so start it so that it survives a closed terminal or SSH session:
 
 ```bash
 nohup bash run.sh > run_all.txt 2>&1 &
-tail -f run_all.txt                  # follow progress (Ctrl+C stops following, not the run)
+tail -f outputs/latest/run_log.txt   # follow the experiment (Ctrl+C stops following, not the run)
 ```
 
 (`tmux` or `screen` work just as well.)
@@ -59,8 +64,25 @@ HF_HOME=$PWD/hf_cache bash run.sh setup    # on the machine with internet
 HF_HOME=$PWD/hf_cache bash run.sh main     # on the GPU machine
 ```
 
-If the two machines have different CPU architectures, delete `.venv/` before running `main` on the
-GPU machine; `run.sh` rebuilds it (this step needs pip access to install packages).
+If the two machines have different CPU architectures, the copied `.venv/` cannot run on the GPU
+machine: `run.sh` detects that, moves it aside to `.venv.old-<timestamp>` and builds a new one (this
+step needs pip access to install packages).
+
+## Python environment
+
+`run.sh` checks the virtual env (`VENV_DIR`, default `.venv/`) at every start:
+
+| Situation | What `run.sh` does |
+|---|---|
+| No env yet | creates it with `PYTHON` (default `python3`, must be >= 3.10) and installs the packages |
+| Env works and was installed from the current `requirements.lock` | reuses it, installs nothing (also works offline) |
+| Env works but `requirements.lock` changed, or a package is missing | installs into the existing env |
+| Env's python cannot run here (copied from another machine / CPU architecture, or broken) | moves it to `.venv.old-<timestamp>` and builds a new one |
+| `REBUILD_ENV=1 bash run.sh ...` | moves the existing env aside and builds a new one |
+
+The first setup writes `requirements.lock` (`pip freeze --local`: every package installed in the
+env, not packages provided by the system or a container); commit it, and later setups install
+exactly those versions. Old `.venv.old-*` folders are never deleted automatically.
 
 ## What happens during the run
 
@@ -68,14 +90,17 @@ GPU machine; `run.sh` rebuilds it (this step needs pip access to install package
 
 | Phase | What | Typical console lines |
 |---|---|---|
-| 1, per model | calibration, unsteered labelling, refusal direction, dev sweep, frozen config, integrity checks, the 9 registered conditions on PopQA test | `BUDGET:`, `GRAY_ZONE`, `REFUSAL_CONTROL`, `DEV_SELECTION`, `FROZEN_CONFIG`, `HOOK_RESET_CHECK`, `ABLATION_CHECK`, `ZERO_VECTOR_CHECK`, `PROGRESS:` |
-| 2, per model | 13 ablations, EntityQuestions, side effects (perplexity, MMLU-500, refusal spillover) | `TIME: ablation[...]`, `TIME: entity_questions[...]` |
-| 3 | statistics and report | `condition=... abstention_score: ...`, `SUMMARY`, `PAIRED`, `HYPOTHESIS` |
+| A, every model and seed (no test split) | calibration, unsteered labelling of train/dev, refusal direction and positive controls, directions and diagnostics, dev sweeps with MMLU/perplexity caps, thresholds, dose-matched nulls, answer-position D_wq ladder | `BUDGET:`, `GRAY_ZONE`, `SEP_LABEL_CHECK`, `REFUSAL_CONTROL`, `DIRECTION_DIAGNOSTIC`, `HOOK_DIAGNOSTIC`, `DEV_SELECTION`, `DOSE_MATCHED_NULL` |
+| freeze | one `frozen_config.json` for all models and seeds, then the test splits are unlocked | `FROZEN_CONFIG`, `TEST_GUARD` |
+| B, per model | test labelling, integrity checks, the registered conditions on PopQA test, the seed-replicated arms | `HOOK_RESET_CHECK`, `ABLATION_CHECK`, `ZERO_VECTOR_CHECK`, `IDK_FORM_CHECK`, `PROGRESS:` |
+| C, per model | ablations, EntityQuestions, TriviaQA, side effects (perplexity, MMLU-500, refusal spillover) | `TIME: ablation[...]`, `TQA_COVERAGE` |
+| analysis | statistics and report | `condition=... abstention_score: ...`, `SEED_CHECK`, `SUMMARY`, `PAIRED`, `HYPOTHESIS` |
 
 `TIME: <step> <seconds>` lines give the elapsed seconds since the start. Right after the first
-calibration, a `BUDGET:` line projects the total runtime. If the projection exceeds 11,520 s, the
-pre-registered degradation ladder is applied automatically (fewer EntityQuestions random-draw
-questions, fewer ablation draws, ...); the planned conditions are never dropped.
+calibration (after a warm-up batch), a `BUDGET:` line projects the total runtime; the projection is
+re-estimated from finished work. Degradation-ladder steps are decided one at a time when their work
+is reached and only if the projection exceeds the 8-hour cap (`BUDGET: at=ladder:<step>`); the
+planned conditions, the seeds and the 20 random draws are never dropped.
 
 Healthy integrity lines look like this:
 
@@ -87,17 +112,24 @@ ZERO_VECTOR_CHECK model=llama32_3b_instruct identical_frac=1.0000 passed=True
 
 ## Outputs
 
-All files go to `outputs/`.
+Every run writes to its own folder `outputs/run_<UTC timestamp>/`; `outputs/latest` points to the
+newest one, and `main.py` refuses to write into a folder that already holds results, so an earlier
+run is never overwritten. Setup logs go to `outputs/setup_logs/`. The first run (2026-11-03) predates
+per-run folders; its files stay directly in `outputs/`.
 
 | File | Contents |
 |---|---|
 | `run_log.txt` | full console output, including every harness line |
+| `setup_log.txt`, `run_manifest.json` | copies of this run's setup log (if setup ran in the same call) and of the manifest |
 | `run_stderr.txt` | library warnings and tracebacks of any failed condition |
 | `setup_log.txt` | download log |
-| `frozen_config.json` | dev-selected layer, strength, thresholds and directions per model, with a SHA-256 hash; written before any test-set forward pass |
-| `results.json` | per-question records (condition, model, question id, popularity, knowledge status, outcome, confidence, output text), metrics per condition and stratum, hypothesis analyses H1-H4, side effects, timings |
+| `frozen_config.json` | dev-selected layer, strength, thresholds, nulls and directions per model and seed, with SHA-256 hashes and the code / amendment / lockfile hashes; written once, before any test-split forward pass |
+| `results.json` | metrics per condition and stratum (incl. gains / losses, surplus per answered item), hypothesis analyses H1-H4, per-seed tables, paired rows, diagnostics, side effects, timings |
+| `per_item/<model>/*.jsonl.gz` | every per-item output: every condition, seed and split (test, seeds, transfer, dev sweeps), unsteered labels and the 8 samples |
 | `samples_<condition>.jsonl` | 50 random outputs per condition for a manual spot check |
 | `audit.csv` | 300 outputs per model, stratified by condition and label, with an empty `human_label` column |
+| `audit_h1a.csv` | up to 50 outputs per (H1a arm x transition vs unsteered), with `auto_label`, `strict_label`, empty `judge_label` and `human_label` |
+| `requirements.lock` | the exact package versions of the run |
 
 `run_manifest.json` (project root) records the exact model commits and library versions.
 
@@ -120,26 +152,42 @@ for a correct answer, 0 for "I don't know" and -1 for a wrong answer, reported x
 
 ### After the run: manual audit (from the plan)
 
-Open `outputs/audit.csv`, fill the `human_label` column (`correct`, `abstained` or `wrong`) for the
-600 rows, and compare with `auto_label`. The plan's target is Cohen's kappa >= 0.8. If it is
-missed, the classification rules in `scoring.py` are revised once and the saved generations
-are rescored; no GPU time is needed.
+Open `outputs/latest/audit_h1a.csv` (and the registered `audit.csv` next to it), fill the
+`human_label` column (`correct`, `abstained` or `wrong`), then (each command works on the newest run
+folder by default; `--run-dir outputs/run_<...>` picks another, `--run-dir outputs` the first run):
+
+```bash
+python audit.py judge --backend anthropic        # optional LLM judge; sends questions and outputs to the API
+python audit.py judge --backend hf --judge-model <local model, not one of the two under test>
+python audit.py score                            # kappa tables + H1a rescored under auto / strict / judge labels
+```
+
+The plan's target is Cohen's kappa >= 0.8. If it is missed, the classification rules in
+`scoring.py` are revised once and the saved generations are rescored; no GPU time is needed.
+
+### Re-analysing a finished run (no GPU)
+
+`python reanalyze.py [--run-dir DIR]` recomputes the corrected statistics (amendment A1/A3/A6/A7)
+from a finished run's saved records (the newest run folder by default): the first run's
+`results.json`, or the `per_item/` store of later runs. It writes `<run folder>/reanalysis_<date>/`.
+The re-analysis of the first run is in `outputs/reanalysis_2026-11-04/`.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `PREFLIGHT FAILED: torch cannot see a CUDA GPU` | The installed torch is CPU-only. Use a wheel index that matches your CUDA version, e.g. `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 bash run.sh`, or run inside an NVIDIA PyTorch container (`run.sh` reuses its torch). Remove `.venv/` first so the env is rebuilt. |
+| `PREFLIGHT FAILED: torch cannot see a CUDA GPU` | The installed torch is CPU-only. Use a wheel index that matches your CUDA version, e.g. `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128 bash run.sh`, or run inside an NVIDIA PyTorch container (`run.sh` reuses its torch). Add `REBUILD_ENV=1` so the env is rebuilt. |
 | `a bf16 matmul on the GPU failed` | The torch build does not support the GPU architecture (common on new GPUs). Install a newer CUDA build as above. |
 | `Could not create a virtual env` | `sudo apt install python3-venv`, or point `PYTHON=` to another interpreter. |
-| `CONDITION_FAILED: <name> [<model>] ...` | That condition crashed; all others still ran. The traceback is in `outputs/run_stderr.txt`. |
+| `pip failed. Installing packages needs network access ...` | The env had to be (re)built or updated without network. Run `bash run.sh setup` where PyPI is reachable, or use the env from that machine if the CPU architecture matches. |
+| `CONDITION_FAILED: <name> [<model>] ...` | That condition crashed; all others still ran. The traceback is in `outputs/latest/run_stderr.txt`. |
 | `MODEL_SETUP_FAILED` | A per-model step before the test conditions crashed (see `run_stderr.txt`); the other model still runs. |
 | Download errors during setup | Rerun `bash run.sh setup`; finished datasets are skipped and model downloads resume. |
 | The run is slower than planned | Nothing to do: the `BUDGET:` projection triggers the degradation ladder automatically. |
 
 **Reruns.** The protocol is pre-registered: each test configuration is meant to run exactly once.
-A rerun overwrites `outputs/`; keep the previous folder (rename it) if a run has to be repeated, and
-report it.
+A rerun gets its own `outputs/run_<UTC timestamp>/` folder and never overwrites an earlier one;
+report every repeated run.
 
 **Using Meta's official Llama repository instead of the mirror.** Once Meta has approved your Hugging
 Face account, change `hf_id` for Llama in `config.py` to `meta-llama/Llama-3.2-3B-Instruct`, log in
@@ -149,7 +197,8 @@ with `hf auth login`, and run `bash run.sh` again.
 
 | File | Role |
 |---|---|
-| `run.sh` | one-command runner (the only script you need) |
+| `run.sh` | one-command runner (the only script you need); writes / installs `requirements.lock` |
+| `preregistration_amendment_2026-11-04.md` | dated amendment to the plan (corrections, withdrawn results, A1-A14) |
 | `setup.py` | downloads models and datasets, writes `run_manifest.json` |
 | `main.py` | the experiment: condition registry and phases (docstring documents the full protocol) |
 | `config.py` | all pre-registered constants (models, prompts, grids, seeds, budget) |
@@ -158,5 +207,8 @@ with `hf auth login`, and run `bash run.sh` again.
 | `steering.py` | forward hooks, direction fitting, random directions |
 | `baselines.py`, `methods.py` | baselines and steering methods (class names follow the plan) |
 | `pipeline.py` | per-model phases, ablations, side effects, time budget |
-| `scoring.py`, `report.py` | answer matching, metrics, statistics, printed report and output files |
+| `scoring.py` | answer matching, outcome classification, metric (unchanged) |
+| `stats.py`, `analysis_core.py` | corrected inference (bootstrap with the valid-resample rule, sign-flip tests, family-wise Holm, common-grid AURC, net transitions) shared by the report and the re-analysis |
+| `report.py` | hypotheses, printed report and output files |
+| `reanalyze.py`, `audit.py` | offline re-analysis of a finished run; measurement audit and LLM judge |
 | `experiment_plan.yaml` | the pre-registered plan |

@@ -4,6 +4,7 @@ activation caching.
 Layer convention everywhere: layer L is the 0-indexed decoder block model.model.layers[L]; its
 output residual is hidden_states[L + 1] (hidden_states[0] is the embedding output).
 """
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,9 +13,11 @@ import torch.nn.functional as F
 from transformers import (AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LogitsProcessor,
                           LogitsProcessorList)
 
-from config import BATCH_SIZE, IDK_STRING, LLAMA_DATE_STRING, SAMPLE_BATCH_PROMPTS, SYSTEM_PROMPT
+from config import BATCH_SIZE, IDK_STRING, IDK_VARIANTS, LLAMA_DATE_STRING, SAMPLE_BATCH_PROMPTS, SYSTEM_PROMPT
 
-DEVICE = "cuda"
+# The experiment runs on one CUDA GPU; STEER_DEVICE=cpu exists only for the CPU smoke test of the
+# code paths (tiny random models), never for a reported run.
+DEVICE = os.environ.get("STEER_DEVICE", "cuda")
 LOGSOFTMAX_CHUNK = 1024
 
 
@@ -52,7 +55,11 @@ class ChatFormatter:
         if tok.eos_token_id is not None:
             stop.add(tok.eos_token_id)
         self.stop_ids = sorted(stop)
+        # amendment A5: canonical reference "I don't know." (with the period the prompt asks for);
+        # the margin's abstain term sums both written forms (see steering.SteeredQA.idk_logprob)
         self.idk_ids = tok(IDK_STRING, add_special_tokens=False).input_ids
+        self.idk_variant_ids = [tok(s, add_special_tokens=False).input_ids for s in IDK_VARIANTS]
+        assert self.idk_variant_ids[0] == self.idk_ids, "IDK_VARIANTS[0] must be IDK_STRING"
         self.pad_id = tok.pad_token_id
 
     def _render(self, messages, add_generation_prompt):
