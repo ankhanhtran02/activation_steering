@@ -24,19 +24,39 @@ import torch
 import analysis_core as AC
 import stats as ST
 from baselines import PopularityGate, RandomDirectionPlacebo, cross_fitted_proba, fit_l2_logreg
-from config import (AUDIT_H1A_PATH, AUDIT_PATH, AUDIT_PER_MODEL, C_GRID, COSINE_NULL_SEED,
-                    COVERAGE_POINTS, LAMBDA_PRIMARY, LAMBDAS, N_COSINE_NULL, N_SAMPLES_PER_CONDITION, N_SEEDS,
-                    N_SPLIT_RESAMPLES, OUT_DIR, PER_ITEM_DIR, RESULTS_PATH, SEEDED_CONDITIONS,
-                    STEERING_CONDITIONS)
-from scoring import (A_, C_, W_, STATE_NAMES, abstention_score, aurc, auroc, cochran_armitage, empirical_percentile,
-                     match_coverage, matched_score, selective_accuracy_at, summary_metrics, transition_metrics)
-from steering import cosine, random_cosine_null, within_question_direction
+from config import (AMBIGUOUS_RELATIONS, AUDIT_H1A_PATH, AUDIT_PATH, AUDIT_PER_MODEL, C_GRID, COSINE_NULL_SEED,
+                    COVERAGE_POINTS, JUDGE_DISAGREEMENTS_PATH, JUDGE_N_DISAGREEMENT_ROWS, LAMBDA_PRIMARY, LAMBDAS,
+                    N_COSINE_NULL, N_SAMPLES_PER_CONDITION, N_SEEDS, N_SPLIT_RESAMPLES, OUT_DIR, PER_ITEM_DIR,
+                    RESULTS_PATH, SEEDED_CONDITIONS, STEERING_CONDITIONS)
+from scoring import (A_, C_, W_, STATE_NAMES, abstention_score, aurc, auroc, cochran_armitage, empirical_percentile, spearman,
+                     match_coverage, matched_score, reclassify_states, selective_accuracy_at, summary_metrics,
+                     transition_metrics)
+from steering import cosine, diff_of_means, random_cosine_null, unit, within_question_direction
 
 KS_REGIME = {"known": "known", "stored_outcompeted": "outcompeted", "missing": "missing"}
 SAME_SIGNAL = {"knowledge_dir_steer": "ku_projection", "read_dir_steer": "read_projection",
                "within_question_dir_steer": "wq_answer_projection", "refusal_dir_steer": "refusal_projection"}
-PERCENTILE_CONDITIONS = STEERING_CONDITIONS + ["read_dir_steer", "dose_matched_null_shuffled_ku",
-                                               "dose_matched_null_cov_random", "dose_matched_null_negated_ku"]
+PERCENTILE_CONDITIONS = STEERING_CONDITIONS + ["read_dir_steer", "dose_matched_placebo_force",
+                                               "knowledge_dir_steer_within_relation",
+                                               "knowledge_dir_steer_between_relation"]
+DOSE_MATCHED_ARMS = ("dose_matched_placebo_", "knowledge_dir_steer_within_relation", "knowledge_dir_steer_between_relation")
+# outputs that are identical by construction in some runs (e.g. tuned gated strength == c*)
+KNOWN_IDENTICAL = {frozenset(("margin_gated_steer_knowledge", "margin_gated_steer_knowledge_tuned"))}
+
+
+def wilson(k, n, z=1.959964):
+    if n == 0:
+        return [float("nan"), float("nan")]
+    p = k / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return [c - h, c + h]
+
+
+def ladder_names(r):
+    """{c: condition name} of the knowledge dose ladder at L* (c* is knowledge_dir_steer itself)."""
+    return {c: ("knowledge_dir_steer" if c == r.frozen["c_star"] else f"knowledge_dir_steer_c{c:g}") for c in C_GRID}
 
 
 def fmt(v):
@@ -160,11 +180,14 @@ def condition_metrics(r, out, base, split="test"):
 
 
 # ----------------------------------------------------------------------------- knowledge signals (H3)
-def knowledge_signals(r):
+def knowledge_signals(r, test_states=None):
     """Amendment A6: H3 on answered items (unsteered C vs W); relation-only and popularity+relation
     baselines fit on answered train items; canonical within-decile AUROC = same-decile pair AUROC
-    (stats.within_stratum_auroc) with a bootstrap CI."""
+    (stats.within_stratum_auroc) with a bootstrap CI. test_states: alternative labels of the unsteered
+    test outputs (final F9: judge labels; train/dev labels stay automatic)."""
     st = {s: r.uout[s].states for s in ("train", "dev", "test")}
+    if test_states is not None:
+        st["test"] = np.asarray(test_states)
     ans = {s: st[s] != A_ for s in st}
     y = {s: st[s] == C_ for s in st}
     feats = {s: r.cache[s]["resid_last"] for s in ("train", "dev", "test")}
@@ -201,12 +224,45 @@ def knowledge_signals(r):
                          "train_oof": np.where(np.isnan(oof), sign * mdl.predict_proba(feats["train"][:, Lp].numpy())[:, 1], oof)}
     internal = [k for k in ("margin", "ku_projection", "read_projection", "sep_probe", "correctness_probe")
                 if k not in probes or probes[k].get("status") != "undefined"]
+    # final F11: the combination models are fitted on train, where D_ku / D_read projections were
+    # in-sample (the directions were fitted on the same train labels); they are now cross-fitted
+    # (5 folds: direction fitted on 4/5 of train, projected on the held-out 1/5), like the probes.
+    L = r.frozen["L_star"]
+    Rtr = r.cache["train"]["resid_last"][:, L]
+    known, unknown = r.extras["known_unknown_masks"]
+
+    def crossfit_projection(pos, neg, folds=5):
+        out = np.full(len(pos), np.nan)
+        fold = np.random.default_rng(13).integers(0, folds, len(pos))
+        for f in range(folds):
+            tr, te = fold != f, fold == f
+            if (pos & tr).sum() == 0 or (neg & tr).sum() == 0 or te.sum() == 0:
+                continue
+            d = unit(diff_of_means(Rtr, pos & tr, neg & tr))
+            out[te] = -(Rtr[torch.as_tensor(te)] @ d).numpy()
+        return out
+    st_tr = r.uout["train"].states
     sig = {"test": {"margin": r.margin["test"], "ku_projection": r.signal("ku_projection", "test"),
                     "read_projection": r.signal("read_projection", "test"),
                     "sep_probe": probes["sep_probe"]["test"], "correctness_probe": probes["correctness_probe"]["test"]},
-           "train": {"margin": r.margin["train"], "ku_projection": r.signal("ku_projection", "train"),
-                     "read_projection": r.signal("read_projection", "train"),
+           "train": {"margin": r.margin["train"], "ku_projection": crossfit_projection(unknown, known),
+                     "read_projection": crossfit_projection(st_tr == W_, st_tr == C_),
                      "sep_probe": probes["sep_probe"]["train_oof"], "correctness_probe": probes["correctness_probe"]["train_oof"]}}
+    for nm in ("ku_projection", "read_projection"):         # a fold without both classes: fall back in-sample
+        bad = ~np.isfinite(sig["train"][nm])
+        if bad.any():
+            sig["train"][nm][bad] = r.signal(nm, "train")[bad]
+    # final F11: the H3a internal signal is pre-specified on dev (highest AUROC among answered dev items),
+    # not picked on test as in run 2 (report.py chose both arms of H3a by test AUROC)
+    dev_ans = ans["dev"]
+    dev_sig = {"margin": r.margin["dev"], "ku_projection": r.signal("ku_projection", "dev"),
+               "read_projection": r.signal("read_projection", "dev")}
+    dev_auc = {k: auroc(y["dev"][dev_ans], np.asarray(s)[dev_ans]) for k, s in dev_sig.items()}
+    for pname in ("sep_probe", "correctness_probe"):
+        if pname in internal:
+            dev_auc[pname] = probes[pname]["dev_auroc_answered"]
+    best_dev = max([k for k in internal if k in dev_auc and math.isfinite(dev_auc[k])] or internal,
+                   key=lambda k: np.nan_to_num(dev_auc.get(k, float("nan")), nan=-1.0))
     pop = {s: r.signal("popularity", s) for s in ("train", "test")}
     sur = {s: r.cache[s]["surprisal"] for s in ("train", "test")}
     rel = {s: np.array([it.prop for it in r.items[s]], dtype=object) for s in ("train", "test")}
@@ -265,7 +321,26 @@ def knowledge_signals(r):
     out["_H3a"] = {"best_internal": best_internal, "frequency_baseline": freq,
                    "best_minus_frequency_baseline": out[best_internal]["auroc_known"] - out[freq]["auroc_known"],
                    "best_minus_popularity_surprisal": out[best_internal]["auroc_known"] - out["popularity_surprisal_logreg"]["auroc_known"],
-                   **{f"diff_{k}": v for k, v in h3a.items()}}
+                   **{f"diff_{k}": v for k, v in h3a.items()},
+                   "note": "run-2 style (both arms picked by test AUROC); the final H3 verdict uses _H3_final"}
+    # final F11: pre-specified signal (dev) against the registered comparator (popularity + surprisal,
+    # primary) and the amendment-A6 comparator (popularity + relation, secondary)
+    fin = {"internal_signal_dev_selected": best_dev, "dev_auroc": dev_auc}
+    s_int = np.asarray(sig["test"][best_dev])[m]
+    for comp in ("popularity_surprisal_logreg", "popularity+relation"):
+        s_cmp = np.asarray(sig["test"][comp])[m]
+        bb = ST.paired_bootstrap(lambda idx, s_cmp=s_cmp: auroc(yt[idx], s_int[idx]) - auroc(yt[idx], s_cmp[idx]), len(yt))
+        fin[f"vs_{comp}"] = {"diff": out[best_dev]["auroc_known"] - out[comp]["auroc_known"], **bb}
+    fin["internal_auroc"] = out[best_dev]["auroc_known"]
+    fin["internal_within_decile_auroc"] = out[best_dev]["within_decile_auroc"]
+    fin["internal_within_decile_ci"] = out[best_dev]["within_decile_ci"]
+    fin["max_within_decile_auroc_any_internal"] = max(out[k]["within_decile_auroc"] for k in internal)
+    fin["min_within_decile_auroc_any_internal"] = min(out[k]["within_decile_auroc"] for k in internal)
+    fin["increment_over_popularity"] = out[f"popularity+{best_dev}"]["incremental_auroc"]
+    fin["increment_over_popularity_ci"] = out[f"popularity+{best_dev}"]["incremental_ci"]
+    fin["increment_over_popularity_relation"] = out[f"popularity+relation+{best_dev}"]["incremental_auroc"]
+    fin["increment_over_popularity_relation_ci"] = out[f"popularity+relation+{best_dev}"]["incremental_ci"]
+    out["_H3_final"] = fin
     out["_probes"] = {k: {kk: vv for kk, vv in v.items() if kk in ("layer", "dev_auroc_answered", "C", "status")}
                       for k, v in probes.items()}
     out["_n_answered"], out["_n_correct"] = int(m.sum()), int(yt.sum())
@@ -343,8 +418,30 @@ def seed_analysis(r):
         if "knowledge_dir_steer" in outs:
             e["H1a"] = AC.h1a(v)
             e["H1a_read"] = AC.h1a(v, "read_dir_steer") if "read_dir_steer" in outs else None
-            e["H1c"] = AC.h1c(v)
+            e["H1c_registered_cstar"] = AC.h1c(v)
+            if "margin_gated_steer_knowledge_tuned" in outs:
+                e["H1c"] = AC.h1c(v, "margin_gated_steer_knowledge_tuned")
+            if "dose_matched_placebo_force" in outs:
+                e["H1b_uniform_push"] = AC.surplus_difference(v, "knowledge_dir_steer", "dose_matched_placebo_force")
+            if all("judge_states" in o.extra for o in outs.values()):
+                vj = _alt_view(v, outs["unsteered"].extra["judge_states"],
+                               {k: o.extra["judge_states"] for k, o in outs.items()})
+                e["H1a_judge"] = AC.h1a(vj)
         res["per_seed"][s] = e
+    # final F12: replication rule for equivalence (amendment A8's same-sign rule cannot judge a null
+    # result): a seed-0 H1a outcome is replicated when every other seed has the same H1a category
+    # (equivalent / non_superior / inferior / superior / inconclusive); same for H1c's rejection flag
+    cats = {s: e.get("H1a", {}).get("category") for s, e in res["per_seed"].items()}
+    h1c_rej = {s: bool(e.get("H1c", {}).get("defined") and e["H1c"].get("ci_low", -1) > 0 and
+                       e["H1c"].get("delta_vs_gated_refusal", -1) > 0) for s, e in res["per_seed"].items()}
+    non_sup = {s: bool(e.get("H1a", {}).get("defined") and e["H1a"].get("ci_high", 99) < 3) for s, e in res["per_seed"].items()}
+    res["replication"] = {"H1a_categories": cats,
+                          "H1a": "replicated" if len(set(cats.values())) == 1 and len(cats) > 1 else "not_replicated",
+                          "H1a_non_superior_all_seeds": all(non_sup.values()) if non_sup else False,
+                          "H1a_superior_any_seed": any(c == "superior" for c in cats.values()),
+                          "H1c_rejects_by_seed": h1c_rej,
+                          "H1c": "replicated" if len(set(h1c_rej.values())) == 1 and len(h1c_rej) > 1 else "not_replicated",
+                          "rule": "every seed has the seed-0 category (final F12)"}
     names = sorted({n for e in res["per_seed"].values() for n in e["conditions"]})
     for n in names:
         for metric in ("abstention_score", "surplus_vs_threshold"):
@@ -369,6 +466,8 @@ def identical_per_seed_check(so):
     for i in range(len(keys)):
         for j in range(i + 1, len(keys)):
             (n1, s1), (n2, s2) = keys[i], keys[j]
+            if s1 == s2 and frozenset((n1, n2)) in KNOWN_IDENTICAL:
+                continue
             if np.array_equal(cells[keys[i]], cells[keys[j]]) and (n1 != n2 or s1 != s2):
                 issues.append({"a": f"{n1}[seed={s1}]", "b": f"{n2}[seed={s2}]",
                                "kind": "same_condition_across_seeds" if n1 == n2 else "different_conditions"})
@@ -376,9 +475,103 @@ def identical_per_seed_check(so):
     vec = {n: tuple(round(abstention_score(cells[(n, s)]), 6) for s in sorted(so) if (n, s) in cells) for n in names}
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
+            if frozenset((names[i], names[j])) in KNOWN_IDENTICAL:
+                continue
             if len(vec[names[i]]) > 1 and vec[names[i]] == vec[names[j]]:
                 issues.append({"a": names[i], "b": names[j], "kind": "identical_per_seed_scores"})
     return {"n_issues": len(issues), "issues": issues}
+
+
+def h1a_sweep(r, v, outs):
+    """Final F12: H1a's surplus (and gated steering vs gated refusal) at every dose of the knowledge
+    ladder, so the equivalence claim is tested along the coverage range and not at one dev-chosen point
+    (run 2: Qwen -2.0 at 6% coverage in run 1 vs -0.67 at 16% in run 2 on the same items). Doses that
+    are not clean on dev (degenerate > 5%) are reported but do not enter the summary."""
+    clean = set(r.frozen.get("clean_doses", []))
+    res, pvals = {}, {}
+    for c, name in ladder_names(r).items():
+        if name not in v.outs:
+            continue
+        h = AC.h1a(v, name)
+        e = {"c": c, "dev_clean": c in clean, "abstention_rate": float((v.outs[name] == A_).mean()),
+             "degenerate_rate_test": float(outs[name].degenerate.mean()), "h1a": h,
+             "gated_vs_gated_refusal": AC.gated_vs_refusal(v, v.outs[name])}
+        res[f"c{c:g}"] = e
+        if c in clean and math.isfinite(h.get("perm_p", float("nan"))):
+            pvals[f"c{c:g}"] = h["perm_p"]
+    adj = ST.holm(list(pvals.values()))
+    for k, a in zip(pvals, adj):
+        res[k]["h1a"]["holm_p_within_sweep"] = float(a)
+    inc = [e for e in res.values() if e["dev_clean"] and e["h1a"].get("defined")]
+    summary = {"n_clean_doses": len(inc), "categories": {f"c{e['c']:g}": e["h1a"]["category"] for e in inc},
+               "any_superior": any(e["h1a"]["category"] == "superior" for e in inc),
+               "all_non_superior": bool(inc) and all(e["h1a"]["ci_high"] < 3 for e in inc),
+               "all_equivalent": bool(inc) and all(e["h1a"]["category"] == "equivalent" for e in inc),
+               "max_surplus": max((e["h1a"]["surplus"] for e in inc), default=float("nan")),
+               "max_ci_high": max((e["h1a"]["ci_high"] for e in inc), default=float("nan")),
+               "any_gated_beats_refusal": any(e["gated_vs_gated_refusal"].get("ci_low", -1) > 0 for e in inc)}
+    return {"per_dose": res, "summary": summary}
+
+
+def _alt_view(v, base, outs):
+    return AC.ModelView(v.model, v.dataset, v.qids, v.tiebreak, base, v.margin, outs, v.conf, None, v.tau1,
+                        tercile=v.tercile, decile=v.decile, kstatus=v.kstatus, relation=v.relation, popularity=v.popularity,
+                        extras=v.extras)
+
+
+def _subset_view(v, mask):
+    sub = lambda a: None if a is None else np.asarray(a)[mask]
+    return AC.ModelView(v.model, v.dataset, [q for q, m in zip(v.qids, mask) if m], v.tiebreak[mask], v.base[mask],
+                        v.margin[mask], {k: x[mask] for k, x in v.outs.items()}, {k: x[mask] for k, x in v.conf.items()},
+                        None, v.tau1, tercile=sub(v.tercile), decile=sub(v.decile), kstatus=sub(v.kstatus),
+                        relation=sub(v.relation), popularity=sub(v.popularity), extras=v.extras)
+
+
+def key_results(r, vv, outs_names):
+    """The verdict-relevant quantities recomputed on one labelling of the same outputs."""
+    out = {"H1a": AC.h1a(vv)}
+    if "margin_gated_steer_knowledge_tuned" in vv.outs:
+        out["H1c"] = AC.h1c(vv, "margin_gated_steer_knowledge_tuned")
+    if "dose_matched_placebo_force" in vv.outs:
+        out["H1b_uniform_push"] = AC.surplus_difference(vv, "knowledge_dir_steer", "dose_matched_placebo_force")
+    sweep = {}
+    for c, name in ladder_names(r).items():
+        if name in vv.outs and c in set(r.frozen.get("clean_doses", [])):
+            sweep[f"c{c:g}"] = AC.h1a(vv, name)["category"]
+    out["H1a_sweep_categories"] = sweep
+    w = vv.base == W_
+    for name in ("within_question_dir_steer", "within_question_dir_steer_own"):
+        if name in vv.outs and w.any():
+            out[f"W_to_C|{name}"] = float((vv.outs[name][w] == C_).mean())
+    return out
+
+
+def label_sensitivity(r, outs, v):
+    """Final F8/F9/F11: the verdict-relevant results under other labellings of the same outputs:
+    registered abstention rule (without the "Don't know." fix), strict exact match, the LLM judge, and
+    the automatic labels restricted to relations whose gold labels are rarely ambiguous."""
+    items = r.items["test"]
+    aliases = [it.aliases for it in items]
+    res = {}
+    u = r.uout["test"]
+    variants = {"registered_abstention_rule": (reclassify_states(u.texts, aliases, True),
+                                               {k: reclassify_states(o.texts, aliases, True) for k, o in outs.items()}),
+                "strict_exact_match": (u.strict_states(), {k: o.strict_states() for k, o in outs.items()})}
+    if "judge_states" in u.extra:
+        variants["judge"] = (u.extra["judge_states"], {k: o.extra.get("judge_states", o.states) for k, o in outs.items()})
+    for lab, (b, o2) in variants.items():
+        try:
+            res[lab] = key_results(r, _alt_view(v, b, o2), list(outs))
+            res[lab]["n_changed_unsteered_labels"] = int((np.asarray(b) != u.states).sum())
+        except Exception as e:
+            res[lab] = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+    mask = ~np.isin(np.asarray(v.relation, dtype=object), list(AMBIGUOUS_RELATIONS))
+    if mask.sum() >= 50:
+        res["unambiguous_relations"] = {**key_results(r, _subset_view(v, mask), list(outs)), "n_items": int(mask.sum()),
+                                        "excluded_relations": list(AMBIGUOUS_RELATIONS)}
+    else:
+        res["unambiguous_relations"] = {"status": "undefined", "reason": f"only {int(mask.sum())} items"}
+    return res
 
 
 def analyze_model(r):
@@ -427,18 +620,27 @@ def analyze_model(r):
         hyp["H1a"] = AC.h1a(v)
         hyp["H1a_read"] = AC.h1a(v, "read_dir_steer") if "read_dir_steer" in outs else None
         hyp["H1b"] = AC.h1b(v)
-        hyp["H1b_dose_matched_nulls"] = {t: {"surplus": sur(f"dose_matched_null_{t}"),
-                                             "matched_on_dev": outs[f"dose_matched_null_{t}"].extra.get("matched_on_dev"),
-                                             "learned_minus_null": AC.surplus_difference(v, "knowledge_dir_steer",
-                                                                                         f"dose_matched_null_{t}")}
-                                         for t in ("shuffled_ku", "cov_random", "negated_ku")
-                                         if f"dose_matched_null_{t}" in outs}
+        # final F3-F5: dose-matched arms (uniform push, D_ku decomposition, sign-aligned random draws)
+        arms = {n: bool(o.extra.get("matched_on_dev")) for n, o in outs.items() if n.startswith(DOSE_MATCHED_ARMS)}
+        hyp["H1b_final"] = AC.h1b_dose_matched(v, arms)
+        hyp["H1b_final"]["dev_matching"] = r.frozen.get("placebos")
+        hyp["H1b_final"]["ku_decomposition"] = r.extras.get("ku_decomposition", {}).get(r.frozen["L_star"])
+        hyp["H1a_sweep"] = h1a_sweep(r, v, outs)
         hyp["H1d"] = AC.h1d(v)
         hyp["H1f"] = AC.h1f(v, hyp["H1a"])
         hyp["always_abstain_reference"] = {n: S(n) for n in ("always_abstain", "unsteered", "confidence_threshold_margin",
                                                                "knowledge_dir_steer") if n in res["conditions"]}
+        if "always_abstain" in outs:
+            X, Z = outs["knowledge_dir_steer"].states, outs["always_abstain"].states
+            hyp["always_abstain_reference"]["knowledge_minus_always_abstain"] = {
+                "diff": S("knowledge_dir_steer") - S("always_abstain"),
+                **ST.paired_bootstrap(lambda idx: abstention_score(X[idx]) - abstention_score(Z[idx]), len(X))}
     if "margin_gated_steer_knowledge" in outs:
-        hyp["H1c"] = AC.h1c(v)
+        hyp["H1c_registered_cstar"] = AC.h1c(v)
+    if "margin_gated_steer_knowledge_tuned" in outs:
+        hyp["H1c"] = {**AC.h1c(v, "margin_gated_steer_knowledge_tuned"), "c_gate": r.frozen.get("c_gate"),
+                      "c_star": r.frozen.get("c_star"), "dev_tuning": r.frozen.get("gated_tuning"),
+                      "definition": "final F2: gated steering at its dev-tuned strength"}
     if "margin_gated_steer_wq" in outs:
         hyp["H4d_gated"] = AC.h1c(v, "margin_gated_steer_wq")
     for name in ("majority_vote_k8", "best_of_k8"):
@@ -447,41 +649,72 @@ def analyze_model(r):
                                        "vs_threshold_operating_point": S(name) - S("confidence_threshold_margin")}
     dose = r.extras.get("teacher_forced_dose_response")
     if dose:
+        # final F6: statistics on the dev-clean grid; comparison directions on the same grid
         hyp["H1e"] = {k: {kk: vv for kk, vv in val.items() if kk not in ("margins", "c_flip", "m0")}
                       for k, val in dose.items() if isinstance(val, dict) and "spearman_m0_cflip" in val}
+        hyp["H1e"]["grid"] = dose.get("grid")
+        hyp["H1e"]["clean_doses_dev"] = dose.get("clean_doses_dev")
         hyp["H1e"]["generation_flip_agreement"] = dose.get("generation_flip_agreement")
-        if "random_s0" in dose:
-            hyp["H1e"]["random_margin_ordering_spearman"] = {
-                k: (float(np.corrcoef(dose["knowledge_dir"]["c_flip"], dose[k]["c_flip"])[0, 1])
-                    if np.std(dose[k]["c_flip"]) > 0 else float("nan")) for k in ("random_s0", "random_s1")}
+        kc = dose["knowledge_dir"]["c_flip"]
+        hyp["H1e"]["margin_ordering_spearman_vs_knowledge"] = {
+            k: (spearman(kc, dose[k]["c_flip"]) if np.nanstd(dose[k]["c_flip"]) > 0 else float("nan"))
+            for k in dose if isinstance(dose[k], dict) and "c_flip" in dose[k] and k != "knowledge_dir"}
+        hyp["H1e"]["margins"] = {k: dose[k]["margins"] for k in dose if isinstance(dose[k], dict) and "margins" in dose[k]}
+        hyp["H1e"]["item_indices"] = dose.get("item_indices")
 
-    # H2 (amendment A12: every ablation variant; H2c validity rule)
+    # H2 (amendment A12: every ablation variant; H2c validity rule; final F7: one L_ref, two-sided rule)
     L = r.frozen["L_star"]
     h2a = {}
     null = random_cosine_null(r.dirs["refusal"][L], N_COSINE_NULL, COSINE_NULL_SEED)
-    for k in ("knowledge", "read", "wq", "idk_caa"):
+    for k in ("knowledge", "read", "wq", "idk_caa", "force"):
         if L in r.dirs.get(k, {}):
             h2a[f"cos_refusal_{k}"] = cosine(r.dirs["refusal"][L], r.dirs[k][L])
+    # final F7: the same cosines at every candidate layer (run 2 reported L* only)
+    h2a["per_layer"] = {str(Lc): {f"cos_refusal_{k}": cosine(r.dirs["refusal"][Lc], r.dirs[k][Lc])
+                                  for k in ("knowledge", "idk_caa", "force") if Lc in r.dirs.get(k, {})}
+                        for Lc in r.cand if Lc in r.dirs["refusal"]}
     h2a["null_abs_mean"] = float(np.abs(null).mean())
     h2a["null_abs_p95"] = float(np.percentile(np.abs(null), 95))
+    h2a["max_abs_cos_refusal_idk_caa_any_layer"] = max((abs(x.get("cos_refusal_idk_caa", 0.0)) for x in h2a["per_layer"].values()),
+                                                       default=float("nan"))
+    h2a["max_abs_cos_refusal_knowledge_any_layer"] = max((abs(x.get("cos_refusal_knowledge", 0.0)) for x in h2a["per_layer"].values()),
+                                                         default=float("nan"))
     hyp["H2a"] = h2a
     variants = r.side.get("refusal_control", {}).get("variants", {})
     for vname, info in variants.items():
         tag = "" if vname == "refusal_dir_ablation" else f"[{vname}]"
         hyp[f"H2b{tag}"] = AC.h2b(v, vname, info.get("passed"))
-        hyp[f"H2c{tag}"] = AC.h2c(v, ablation=vname, combo=f"{vname}_plus_knowledge_steer",
-                                  positive_control_passed=info.get("passed"))
+        hyp[f"H2b{tag}"]["L_ref"] = info.get("L_ref")
+        hyp[f"H2c{tag}"] = AC.h2c_final(v, ablation=vname, combo=f"{vname}_plus_knowledge_steer",
+                                        positive_control_passed=info.get("passed"))
         prefix = "random_dir_ablation_s" if vname == "refusal_dir_ablation" else vname.replace("refusal_dir", "random_dir") + "_s"
         rnd = random_draw_names(outs, prefix)
         if rnd:
             hyp[f"H2b{tag}"]["random_ablation_abstention_change_pts"] = [
                 100 * (float((outs[n].states == A_).mean()) - float((base.states == A_).mean())) for n in rnd]
+    # amendment A12 primary arm: registered directional if it passes the positive control without damaging
+    # the model; otherwise mean-ablation (all layers); otherwise mean-ablation at L_ref
+    primary = None
+    for vname in ("refusal_dir_ablation", "refusal_dir_mean_ablation", "refusal_dir_mean_ablation_single_layer"):
+        tag = "" if vname == "refusal_dir_ablation" else f"[{vname}]"
+        h = hyp.get(f"H2b{tag}")
+        if h and h.get("positive_control_passed") and not h.get("ablation_damages_model"):
+            primary = vname
+            break
+    hyp["H2_primary_variant"] = primary or "none (every variant fails its positive control or damages the model)"
     br = r.side.get("benign_refusal_rate")
     if br:
+        from scipy.stats import fisher_exact
+        nb = int(r.side.get("benign_n_prompts", 100))
         rnd = [val for k, val in br.items() if k.startswith("random_dir_placebo_s")]
-        hyp["H2d"] = {name: {"benign_refusal": br[name], "vs_unsteered_pts": 100 * (br[name] - br["unsteered"]),
+        h2d = {}
+        for name in STEERING_CONDITIONS + ["read_dir_steer"]:
+            if name in br:
+                a1, a0 = int(round(br[name] * nb)), int(round(br["unsteered"] * nb))
+                h2d[name] = {"benign_refusal": br[name], "vs_unsteered_pts": 100 * (br[name] - br["unsteered"]),
+                             "n_prompts": nb, "fisher_p_vs_unsteered": float(fisher_exact([[a1, nb - a1], [a0, nb - a0]])[1]),
                              "above_random_p95": bool(rnd and br[name] > np.percentile(rnd, 95))}
-                      for name in STEERING_CONDITIONS + ["read_dir_steer"] if name in br}
+        hyp["H2d"] = h2d
     if "refusal_dir_steer" in outs and "knowledge_dir_steer" in outs:
         Xr, Xk = outs["refusal_dir_steer"].states, outs["knowledge_dir_steer"].states
         fr, fk = ST.surplus_stat(Xr, base.states, margin, tb), ST.surplus_stat(Xk, base.states, margin, tb)
@@ -508,6 +741,13 @@ def analyze_model(r):
                           "over_popularity_relation_ci": sig[f"popularity+relation+{k}"]["incremental_ci"]} for k in internal}
         hyp["H3d"] = {k: {"auroc": sig[k]["popular_consistent_error_auroc"], "ci": sig[k]["popular_consistent_error_ci"]}
                       for k in internal}
+        hyp["H3_final"] = sig["_H3_final"]
+        js = r.uout["test"].extra.get("judge_states")
+        if js is not None:            # final F9: H3 with judge-labelled test correctness
+            sj = knowledge_signals(r, test_states=js)
+            hyp["H3_final_judge_labels"] = sj["_H3_final"]
+            res["knowledge_signals_judge_labels"] = {k: {kk: vv for kk, vv in val.items() if kk != "per_decile"}
+                                                     for k, val in sj.items() if isinstance(val, dict) and not k.startswith("_")}
         res["split_randomness"] = split_randomness(r)
     except Exception as e:  # analysis failure must not hide the condition results
         print(f"ANALYSIS_FAILED: knowledge_signals model={r.name} {type(e).__name__}: {e}", flush=True)
@@ -539,38 +779,53 @@ def analyze_model(r):
     if "knowledge_dir_steer" in outs:
         d = wc_by_status(outs["knowledge_dir_steer"].states)
         so = d["stored_outcompeted"]
+        k_so = int(round(so["W_to_C"] * so["n_wrong"])) if so["n_wrong"] else 0
         hyp["H4a"] = {**d, "so_W_to_C_lt_5pct": bool(so["W_to_C"] < 0.05),
-                      "so_W_to_A_ge_3x_W_to_C": bool(so["W_to_A"] >= 3 * so["W_to_C"])}
+                      "so_W_to_A_ge_3x_W_to_C": bool(so["W_to_A"] >= 3 * so["W_to_C"]),
+                      "so_W_to_C_wilson95": wilson(k_so, so["n_wrong"]),
+                      "so_W_to_C_upper_lt_5pct": bool(so["n_wrong"] and wilson(k_so, so["n_wrong"])[1] < 0.05)}
     perm = random_draw_names(outs, "label_permuted_wq_dir_steer_s")
     wc_perm = [wc(n) for n in perm]
-    for name, rnd_names in (("within_question_dir_steer", draws),
-                            ("within_question_dir_steer_answer_positions", random_draw_names(outs, "wq_answer_random_s"))):
+    # final F10: H4b at the registered shared site (norm-matched random draws, label-permuted D_wq) and
+    # at D_wq's own dev-selected dose (nulls at that same norm)
+    for name, rnd_names, perm_names, key in (
+            ("within_question_dir_steer", draws, perm, "H4b"),
+            ("within_question_dir_steer_own", random_draw_names(outs, "wq_own_random_s"),
+             random_draw_names(outs, "label_permuted_wq_own_s"), "H4b_own_dose")):
         if name not in outs:
             continue
         d = wc_by_status(outs[name].states)
-        refits = [n for n in outs if n.startswith(name + "_r") and n[len(name) + 2:].isdigit()]
-        wr = [wc(n) for n in rnd_names]
-        key = "H4b" if name == "within_question_dir_steer" else "H4b_answer_positions"
-        hyp[key] = {**d, "random_p95": float(np.percentile(wr, 95)) if wr else float("nan"),
-                    "random_null": "isotropic norm-matched (shared site)" if key == "H4b" else
-                    "norm-matched random at the answer-position site",
-                    "label_permuted_p95": float(np.percentile(wc_perm, 95)) if wc_perm else float("nan"),
-                    "label_permuted_draws": wc_perm,
-                    "above_both_nulls": bool(wr and wc_perm and d["overall"]["W_to_C"] > max(np.percentile(wr, 95), np.percentile(wc_perm, 95))),
+        wr, wp = [wc(n) for n in rnd_names], [wc(n) for n in perm_names]
+        hyp[key] = {**d, "random_p95": float(np.percentile(wr, 95)) if wr else float("nan"), "random_draws": wr,
+                    "label_permuted_p95": float(np.percentile(wp, 95)) if wp else float("nan"),
+                    "label_permuted_draws": wp,
+                    "above_both_nulls": bool(wr and wp and d["overall"]["W_to_C"] > max(np.percentile(wr, 95), np.percentile(wp, 95))),
                     "so_minus_missing": d["stored_outcompeted"]["W_to_C"] - d["missing"]["W_to_C"],
-                    "refit_W_to_C": [d["overall"]["W_to_C"]] + [wc(n) for n in sorted(refits)],
-                    "refit_S1": [S(name)] + [S(n) for n in sorted(refits)],
-                    "underpowered": r.gray["info"]["underpowered"]}
-    if "between_question_answer_dir_steer" in outs and "H4b" in hyp:
-        hyp["H4b"]["between_question"] = wc_by_status(outs["between_question_answer_dir_steer"].states)
+                    "S1": S(name), "underpowered": r.gray["info"]["underpowered"]}
+        if key == "H4b_own_dose":
+            hyp[key]["dose"] = r.frozen.get("wq_own")
+            hyp[key]["dev_sweep"] = r.dev.get("wq_own_sweep")
     if "first_token_ban_regenerate" in outs:
         ft = outs["first_token_ban_regenerate"]
         banned = ft.extra["banned"]
         h4c = {}
+        prior_rel = defaultdict(list)
+        for pool in r.data["pools"].values():
+            for it in pool:
+                if it.aliases:
+                    prior_rel[it.prop].append(it.aliases[0])
+        prior = AC.relation_answer_prior(prior_rel)
+        titems = r.items["test"]
         for s in ("stored_outcompeted", "missing", "known"):
             w = (base.states == W_) & (ks == s) & banned
             h4c[f"recovery_{s}"] = float((ft.states[w] == C_).mean()) if w.any() else float("nan")
             h4c[f"n_wrong_{s}"] = int(w.sum())
+            h4c[f"recovery_{s}_wilson95"] = wilson(int((ft.states[w] == C_).sum()), int(w.sum()))
+            # final F10: chance level of a second guess drawn from the relation's answer prior
+            ch = [AC.chance_second_guess(titems[i].prop, titems[i].aliases, titems[i].aliases[0] if titems[i].aliases else "",
+                                         base.texts[i], prior) for i in np.flatnonzero(w)]
+            ch = [x for x in ch if math.isfinite(x)]
+            h4c[f"chance_{s}"] = float(np.mean(ch)) if ch else float("nan")
         h4c["failed_knockout_rate"] = float(ft.extra["failed_knockout"][banned].mean()) if banned.any() else float("nan")
         h4c["unbanned_rows_identical"] = ft.extra["unbanned_rows_identical"]
         ans_b = (base.states != A_) & banned
@@ -590,28 +845,23 @@ def analyze_model(r):
         hyp["gated_knockout_exploratory"] = AC.gated_knockout(
             v, aliases=[it.aliases for it in items], relations=[it.prop for it in items],
             first_aliases=[it.aliases[0] if it.aliases else "" for it in items], prior=AC.relation_answer_prior(by_rel))
-    for name in ("within_question_dir_steer", "margin_gated_steer_wq", "within_question_dir_steer_answer_positions"):
+    for name in ("within_question_dir_steer", "margin_gated_steer_wq", "within_question_dir_steer_own"):
         if name in outs:
             h = {"vs_unsteered": S(name) - abstention_score(base.states)}
             if op is not None:
                 h["vs_threshold_operating_point"] = S(name) - abstention_score(op.states)
             hyp.setdefault("H4d", {})[name] = h
 
-    # dose trends (Cochran-Armitage over the test doses)
-    for src, metric in (("knowledge_dir_steer", "abstention"), ("within_question_dir_steer", "W_to_C")):
-        names = {c: (src if c == r.frozen["c_star"] else f"{src}_c{c:g}") for c in C_GRID}
-        if all(n in outs for n in names.values()):
-            if metric == "abstention":
-                succ = [int((outs[n].states == A_).sum()) for n in names.values()]
-                tot = [len(base)] * len(names)
-            else:
-                w = base.states == W_
-                succ = [int((outs[n].states[w] == C_).sum()) for n in names.values()]
-                tot = [int(w.sum())] * len(names)
-            z, p = cochran_armitage(succ, tot, list(names))
-            res.setdefault("dose_trend", {})[src] = {"metric": metric, "doses": list(names), "counts": succ,
-                                                     "totals": tot, "z": z, "p": p}
+    # dose trend of abstention (Cochran-Armitage) over the dev-clean doses only (final F6: run 2's z = -53
+    # was driven by the degenerate doses)
+    names = {c: n for c, n in ladder_names(r).items() if c in set(r.frozen.get("clean_doses", [])) and n in outs}
+    if len(names) >= 2:
+        succ = [int((outs[n].states == A_).sum()) for n in names.values()]
+        z, p = cochran_armitage(succ, [len(base)] * len(names), list(names))
+        res["dose_trend"] = {"knowledge_dir_steer": {"metric": "abstention", "doses": list(names), "counts": succ,
+                                                     "z": z, "p": p, "clean_doses_only": True}}
 
+    res["label_sensitivity"] = label_sensitivity(r, outs, v)
     res["hypotheses"] = hyp
     res["seeds"] = seed_analysis(r)
     res["entity_questions"] = analyze_transfer(r, "eq")
@@ -653,9 +903,17 @@ def analyze_transfer(r, split):
         out["H1c"] = AC.h1c(v)
     if split == "tqa":
         out["H1d"] = AC.h1d(v)
+        if "dose_matched_placebo_force" in full:           # final F3: placebo at the high-coverage point
+            out["H1d_uniform_push"] = AC.h1d(v, "dose_matched_placebo_force")
         out["coverage_regime"] = {"unsteered_coverage": 1 - float((base.states == A_).mean()),
                                   "selective_accuracy_unsteered_at": {f"{int(c * 100)}": selective_accuracy_at(
                                       base.states, v.margin, v.tiebreak, c) for c in COVERAGE_POINTS}}
+        if "judge_states" in base.extra:
+            vj = _alt_view(v, base.extra["judge_states"], {k: o.extra.get("judge_states", o.states) for k, o in full.items()})
+            out["H1d_judge"] = AC.h1d(vj)
+    if not sub:
+        out["_view"] = v
+        return out
     sbase = sub["unsteered"]
     draws = random_draw_names(sub)
     for name, o in sub.items():
@@ -672,11 +930,15 @@ def analyze_transfer(r, split):
 
 
 # ----------------------------------------------------------------------------- pooled printing
-PRINT_ALIASES = {"confidence_prompt": "confidence_prompt_t050", "margin_gated_steer": "margin_gated_steer_knowledge",
-                 "dose_matched_null": "dose_matched_null_shuffled_ku", "sample_vote": "majority_vote_k8"}
+PRINT_ALIASES = {"confidence_prompt": "confidence_prompt_t050", "margin_gated_steer": "margin_gated_steer_knowledge_tuned",
+                 "dose_matched_placebo": "dose_matched_placebo_force", "sample_vote": "majority_vote_k8",
+                 "within_question_dir_steer_own": "within_question_dir_steer_own"}
 EXPANDED = {"confidence_prompt": ["confidence_prompt", "confidence_prompt_t050", "confidence_prompt_t075"],
-            "margin_gated_steer": ["margin_gated_steer", "margin_gated_steer_knowledge", "margin_gated_steer_wq"],
-            "dose_matched_null": ["dose_matched_null_shuffled_ku", "dose_matched_null_cov_random", "dose_matched_null_negated_ku"],
+            "margin_gated_steer": ["margin_gated_steer", "margin_gated_steer_knowledge", "margin_gated_steer_knowledge_tuned",
+                                   "margin_gated_steer_wq"],
+            "knowledge_dir_steer_dose_ladder": [f"knowledge_dir_steer_c{c:g}" for c in C_GRID],
+            "dose_matched_placebo": ["dose_matched_placebo_force", "knowledge_dir_steer_within_relation",
+                                     "knowledge_dir_steer_between_relation"],
             "sample_vote": ["majority_vote_k8", "best_of_k8"]}
 
 
@@ -1027,6 +1289,8 @@ def per_item_records(name, split, seed, o, items, extra=None):
                "strict_correct": bool(o.strict_correct[i]), "confidence": float(o.confidence[i]),
                "confidence_kind": o.confidence_kind, "ans_logprob": float(o.ans_logprob[i]),
                "n_tokens": int(o.n_tokens[i]), "output": o.texts[i]}
+        if "judge_states" in o.extra:
+            rec["judge_state"] = int(o.extra["judge_states"][i])
         if extra:
             rec.update({k: (v[i] if hasattr(v, "__len__") and len(v) == len(items) else v) for k, v in extra.items()})
         yield rec
@@ -1088,8 +1352,54 @@ def write_per_item(runners):
     return written
 
 
-def write_results(runners, analyses, summary, paired, meta):
-    out = {"meta": meta, "summary": summary, "paired": paired, "models": {}}
+def write_judge_disagreements(runners):
+    """Final F9: up to JUDGE_N_DISAGREEMENT_ROWS rows per model where the judge and the automatic label
+    disagree, stratified by condition (round robin), with an empty human_label column. Rows of the H1-
+    critical arms come first. A human label on these rows settles which labelling a verdict should
+    follow when automatic and judge labels disagree."""
+    rng = np.random.default_rng(3)
+    first = ("unsteered", "knowledge_dir_steer", "margin_gated_steer_knowledge_tuned", "dose_matched_placebo_force")
+    rows = []
+    for r in runners:
+        items = r.items["test"]
+        cells = {}
+        seen = set()
+        for name, o in {"unsteered": r.uout["test"], **all_test_outputs(r)}.items():
+            js = o.extra.get("judge_states")
+            if js is None:
+                continue
+            for i in np.flatnonzero(js != o.states):
+                key = (items[i].qid, o.texts[i])
+                if key in seen:
+                    continue
+                seen.add(key)
+                cells.setdefault(name, []).append(i)
+        order = [n for n in first if n in cells] + sorted(n for n in cells if n not in first)
+        for n in order:
+            cells[n] = [cells[n][j] for j in rng.permutation(len(cells[n]))]
+        picked, depth = [], 0
+        while len(picked) < JUDGE_N_DISAGREEMENT_ROWS and any(depth < len(cells[n]) for n in order):
+            for n in order:
+                if depth < len(cells[n]) and len(picked) < JUDGE_N_DISAGREEMENT_ROWS:
+                    picked.append((n, cells[n][depth]))
+            depth += 1
+        outs = {"unsteered": r.uout["test"], **all_test_outputs(r)}
+        for n, i in picked:
+            o, it = outs[n], items[i]
+            rows.append([r.name, n, it.qid, it.prop, it.question, " | ".join(it.aliases), o.texts[i],
+                         STATE_NAMES[int(o.states[i])], STATE_NAMES[int(o.extra["judge_states"][i])], ""])
+    if not rows:
+        return 0
+    with open(JUDGE_DISAGREEMENTS_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "condition", "qid", "relation", "question", "gold_aliases", "output", "auto_label",
+                    "judge_label", "human_label"])
+        w.writerows(rows)
+    return len(rows)
+
+
+def write_results(runners, analyses, summary, paired, meta, verdict_table=None):
+    out = {"meta": meta, "summary": summary, "paired": paired, "verdicts": verdict_table or {}, "models": {}}
     for r, a in zip(runners, analyses):
         a = {k: ({kk: vv for kk, vv in v.items() if kk != "_view"} if k in ("entity_questions", "triviaqa") and isinstance(v, dict)
                  else v) for k, v in a.items()}

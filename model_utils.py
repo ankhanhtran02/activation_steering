@@ -18,6 +18,9 @@ from config import BATCH_SIZE, IDK_STRING, IDK_VARIANTS, LLAMA_DATE_STRING, SAMP
 # The experiment runs on one CUDA GPU; STEER_DEVICE=cpu exists only for the CPU smoke test of the
 # code paths (tiny random models), never for a reported run.
 DEVICE = os.environ.get("STEER_DEVICE", "cuda")
+# bf16 everywhere in a reported run; STEER_DTYPE=float32 only for the CPU smoke test (CPUs without
+# bf16 units run bf16 matmuls far slower)
+DTYPE = getattr(torch, os.environ.get("STEER_DTYPE", "bfloat16"))
 LOGSOFTMAX_CHUNK = 1024
 
 
@@ -28,7 +31,7 @@ def load_model(spec, revision):
     if tok.pad_token is None or "llama" in spec["name"]:  # plan: Llama pads with its eos token
         tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        spec["hf_id"], revision=revision, dtype=torch.bfloat16, local_files_only=True)
+        spec["hf_id"], revision=revision, dtype=DTYPE, local_files_only=True)
     model.to(DEVICE).train(False)  # inference mode (dropout off)
     model.requires_grad_(False)
     assert len(model.model.layers) == spec["n_layers"], "unexpected layer count"

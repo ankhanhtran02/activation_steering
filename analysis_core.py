@@ -70,21 +70,23 @@ def condition_table(v, names=None):
 
 
 # ----------------------------------------------------------------------------- paired rows
-PAIRED_METHODS = ["knowledge_dir_steer", "read_dir_steer", "within_question_dir_steer",
-                  "within_question_dir_steer_answer_positions", "refusal_dir_steer",
-                  "margin_gated_steer_knowledge", "margin_gated_steer_wq", "dose_matched_null_shuffled_ku",
-                  "dose_matched_null_cov_random", "dose_matched_null_negated_ku", "confidence_prompt_t050",
+PAIRED_METHODS = ["knowledge_dir_steer", "read_dir_steer", "within_question_dir_steer", "refusal_dir_steer",
+                  "margin_gated_steer_knowledge", "margin_gated_steer_knowledge_tuned", "margin_gated_steer_wq",
+                  "dose_matched_placebo_force", "knowledge_dir_steer_within_relation",
+                  "knowledge_dir_steer_between_relation", "within_question_dir_steer_own", "confidence_prompt_t050",
                   "majority_vote_k8", "best_of_k8", "confidence_threshold_margin", "popularity_gate",
                   "always_abstain"]
 
 
 def family_of(method, baseline, dataset):
-    """Registered confirmatory families (plan statistics.multiplicity); everything else exploratory."""
+    """Registered confirmatory families (plan statistics.multiplicity); everything else exploratory.
+    Final F2: H1c is the gated arm at its dev-tuned strength; the gated arm at c* (registered H1c,
+    decided by construction) is exploratory."""
     transfer = dataset != "popqa"
     if method == "knowledge_dir_steer" and baseline == "confidence_threshold_margin":
         return "generalisation" if transfer else "H1"            # H1a
-    if method == "margin_gated_steer_knowledge" and baseline == "confidence_threshold_margin" and not transfer:
-        return "H1"                                               # H1c
+    if method == "margin_gated_steer_knowledge_tuned" and baseline == "confidence_threshold_margin" and not transfer:
+        return "H1"                                               # H1c (final F2)
     if method in ("within_question_dir_steer", "margin_gated_steer_wq"):
         return "generalisation" if transfer else "H4"             # H4d
     return f"exploratory_{dataset}"
@@ -184,19 +186,101 @@ def format_paired(row):
 
 
 # ----------------------------------------------------------------------------- H1
+def h1a_category(point, b):
+    """Final F12: one outcome label per H1a estimate (priority order):
+    superior      surplus >= +5 and 95% CI > 0 (the registered rejection of H1)
+    equivalent    90% CI inside (-3, +3) (the registered TOST prediction)
+    inferior      95% CI < 0 (steering selects worse than the threshold)
+    non_superior  95% CI upper bound < +3 (no meaningful advantage, equivalence not shown)
+    inconclusive  anything else"""
+    if not b.get("defined"):
+        return "undefined"
+    if point >= 5 and b["ci_low"] > 0:
+        return "superior"
+    if b["ci90_low"] > -TOST_MARGIN and b["ci90_high"] < TOST_MARGIN:
+        return "equivalent"
+    if b["ci_high"] < 0:
+        return "inferior"
+    if b["ci_high"] < TOST_MARGIN:
+        return "non_superior"
+    return "inconclusive"
+
+
 def h1a(v, name="knowledge_dir_steer"):
     X = v.outs[name]
     point = S.surplus_point(X, v.base, v.margin, v.tiebreak)
     d = S.coverage_matched_diff(X, v.base, v.margin, v.tiebreak)
     if d is None:
-        return {"status": S.UNDEFINED, "reason": f"{name} answers more items than unsteered", "surplus": point}
-    b = S.paired_bootstrap(S.surplus_stat(X, v.base, v.margin, v.tiebreak), v.n)
+        return {"status": S.UNDEFINED, "reason": f"{name} answers more items than unsteered", "surplus": point,
+                "category": "undefined"}
+    fs = S.surplus_stat(X, v.base, v.margin, v.tiebreak)
+    b = S.paired_bootstrap(fs, v.n)
+    k = int((X != A_).sum())
     out = {"surplus": point, "surplus_per_answered": S.surplus_per_answered(X, v.base, v.margin, v.tiebreak),
-           "answered": int((X != A_).sum()), "perm_p": S.sign_flip_test(d) if b["defined"] else float("nan"), **b}
+           "answered": k, "coverage": k / v.n if v.n else float("nan"),
+           "perm_p": S.sign_flip_test(d) if b["defined"] else float("nan"), **b}
     if b["defined"]:
         out.update({"tost_equivalent_3pts": bool(b["ci90_low"] > -TOST_MARGIN and b["ci90_high"] < TOST_MARGIN),
                     "pragmatist_surplus_ge_5": bool(point >= 5 and b["ci_low"] > 0),
+                    "non_superior_3pts": bool(b["ci_high"] < TOST_MARGIN), "inferior": bool(b["ci_high"] < 0),
                     "underpowered_se_gt_1.6": bool(b["sd"] > 1.6)})
+    out["category"] = h1a_category(point, b)
+    # final F12: the same contrast on the answered-accuracy scale (percentage points): with both arms
+    # answering k items, surplus * n / (2k) is the difference in accuracy among answered items
+    if k > 0:
+        acc = S.paired_bootstrap(lambda idx: fs(idx) * len(idx) / (2.0 * max(1, int((X[idx] != A_).sum()))), v.n)
+        out["answered_accuracy_diff_pp"] = {"point": point * v.n / (2.0 * k), "ci_low": acc["ci_low"],
+                                            "ci_high": acc["ci_high"], "ci90_low": acc["ci90_low"],
+                                            "ci90_high": acc["ci90_high"], "status": acc["status"]}
+    return out
+
+
+def gated_vs_refusal(v, X, boot=True):
+    """Gated steering composed from steered states X (steered where the margin gate fires, unsteered
+    elsewhere) minus gated refusal (the threshold operating point)."""
+    op = v.outs.get("confidence_threshold_margin")
+    if op is None:
+        return {"status": S.UNDEFINED, "reason": "threshold operating point missing"}
+    G = np.where(v.gate(), X, v.base)
+    d = S.per_item_scores(G) - S.per_item_scores(op)
+    out = {"delta_vs_gated_refusal": float(d.mean()), "n_gated": int(v.gate().sum())}
+    if boot:
+        out.update(S.paired_bootstrap(lambda idx: abstention_score(G[idx]) - abstention_score(op[idx]), v.n))
+        out["perm_p"] = S.sign_flip_test(d)
+    return out
+
+
+def h1b_dose_matched(v, arms, learned="knowledge_dir_steer"):
+    """Final F3-F5. arms = {condition: matched_on_dev}. For every dose-matched arm: surplus of the
+    learned direction minus the arm's surplus (each against its own coverage-matched threshold), with
+    the paired bootstrap and TOST at +/- 3 points. The pre-specified placebo is the uniform push
+    (dose_matched_placebo_force); the registered comparison is the best dev-matched random draw."""
+    out = {"learned": learned, "learned_surplus": S.surplus_point(v.outs[learned], v.base, v.margin, v.tiebreak),
+           "learned_abstention_rate": float((v.outs[learned] == A_).mean()), "arms": {}}
+    for name, matched in arms.items():
+        if name not in v.outs:
+            continue
+        sd = surplus_difference(v, learned, name)
+        e = {"matched_on_dev": bool(matched), "abstention_rate": float((v.outs[name] == A_).mean()), **sd}
+        if sd.get("defined"):
+            e["tost_equivalent_3pts"] = bool(sd["ci90_low"] > -TOST_MARGIN and sd["ci90_high"] < TOST_MARGIN)
+            e["learned_exceeds_by_5"] = bool(sd["diff"] >= 5 and sd["ci_low"] > 0)
+        out["arms"][name] = e
+    rnd = [n for n in out["arms"] if n.startswith("dose_matched_placebo_iso_") or n.startswith("dose_matched_placebo_cov_")]
+    usable = [n for n in rnd if out["arms"][n]["matched_on_dev"] and out["arms"][n].get("defined")]
+    out["n_random_arms"], out["n_random_matched_on_dev"] = len(rnd), len(usable)
+    if usable:
+        best = max(usable, key=lambda n: out["arms"][n]["surplus_b"])
+        out["registered_best_matched_random"] = {"arm": best, **{k: out["arms"][best].get(k) for k in
+                                                                 ("diff", "ci_low", "ci_high", "ci90_low", "ci90_high",
+                                                                  "learned_exceeds_by_5", "tost_equivalent_3pts")}}
+    else:
+        out["registered_best_matched_random"] = {
+            "status": S.UNDEFINED, "reason": "no random direction (sign-aligned isotropic or covariance-shaped) reached "
+                                             "knowledge_dir_steer's dev abstention increase without degenerating: random "
+                                             "directions cannot induce clean abstention (pre-registered branch: H1a decides)"}
+    f = out["arms"].get("dose_matched_placebo_force")
+    out["primary_uniform_push"] = (f if f is not None else {"status": S.UNDEFINED, "reason": "uniform push arm missing"})
     return out
 
 
@@ -282,6 +366,21 @@ def h1d(v, name="knowledge_dir_steer"):
         top = comp["grid_top"]
         comp["selective_accuracy_at_grid_top"] = {"steered": S.selective_accuracy_at(X, cx, v.tiebreak, top),
                                                   "unsteered": S.selective_accuracy_at(v.base, v.margin, v.tiebreak, top)}
+    # final F12: steered minus unsteered selective accuracy at each coverage point, paired bootstrap,
+    # TOST at +/- 3 percentage points (the plan's "within 3 points at 70% coverage")
+    tb = v.tiebreak
+    comp["selective_accuracy_diff_pp"] = {}
+    for c in COVERAGE_POINTS:
+        f = lambda idx, c=c: 100.0 * (S.selective_accuracy_at(X[idx], cx[idx], tb[idx], c)
+                                      - S.selective_accuracy_at(v.base[idx], v.margin[idx], tb[idx], c))
+        pt = f(np.arange(v.n))
+        if not math.isfinite(pt):
+            comp["selective_accuracy_diff_pp"][f"{int(c * 100)}"] = {"status": S.UNDEFINED,
+                                                                    "reason": "coverage not reachable"}
+            continue
+        b = S.paired_bootstrap(f, v.n)
+        comp["selective_accuracy_diff_pp"][f"{int(c * 100)}"] = {
+            "point": pt, **b, "tost_equivalent_3pp": bool(b["defined"] and b["ci90_low"] > -3 and b["ci90_high"] < 3)}
     return comp
 
 
@@ -355,6 +454,63 @@ def h2c(v, steer="knowledge_dir_steer", ablation="refusal_dir_ablation",
     b = S.paired_bootstrap(frac, v.n)
     return {**out, "fraction_removed": point, **b, "predicted_ge_0.5": bool(b["defined"] and b["ci_low"] >= 0.5)
             if b["defined"] else None}
+
+
+def _logit(p, n):
+    p = min(max(p, 0.5 / n), 1 - 0.5 / n)
+    return math.log(p / (1 - p))
+
+
+def h2c_final(v, steer="knowledge_dir_steer", ablation="refusal_dir_ablation",
+              combo="refusal_dir_ablation_plus_knowledge_steer", positive_control_passed=None):
+    """Final F7. The registered fraction removed, 1 - [A(abl+steer) - A(abl)] / [A(steer) - A(unst)], is in
+    absolute points, so an ablation that moves baseline abstention changes the headroom (run 2, Qwen:
+    ablation alone 67% -> 38%, fraction -1.59). Validity is now two-sided (|ablation change| <= 5 points
+    for the registered form) and two baseline-robust forms are pre-specified:
+      conditional: on items answered by BOTH the unsteered and the ablated model, the share that steering
+                   turns into abstentions with the ablation vs without; removed = 1 - ablated / intact;
+      log-odds:    1 - [logit A(abl+steer) - logit A(abl)] / [logit A(steer) - logit A(unst)].
+    Primary = registered when valid, else conditional."""
+    reg = h2c(v, steer, ablation, combo, positive_control_passed)
+    if not all(k in v.outs for k in (steer, ablation, combo)):
+        return reg
+    Xs, Xa, Xc = v.outs[steer], v.outs[ablation], v.outs[combo]
+    rise = reg.get("ablation_abstention_change_pts", float("nan"))
+    two_sided_ok = bool(math.isfinite(rise) and abs(rise) <= H2C_MAX_ABLATION_ABST_RISE)
+
+    def cond(idx):
+        S_ = (v.base[idx] != A_) & (Xa[idx] != A_)
+        if S_.sum() < 10:
+            return float("nan")
+        intact = float((Xs[idx][S_] == A_).mean())
+        abl = float((Xc[idx][S_] == A_).mean())
+        return 1 - abl / intact if 100 * intact >= H2C_MIN_STEER_INCREASE else float("nan")
+
+    def lo(idx):
+        n = len(idx)
+        A = lambda X: float((X[idx] == A_).mean())
+        den = _logit(A(Xs), n) - _logit(A(v.base), n)
+        if 100 * (A(Xs) - A(v.base)) < H2C_MIN_STEER_INCREASE or abs(den) < 1e-9:
+            return float("nan")
+        return 1 - (_logit(A(Xc), n) - _logit(A(Xa), n)) / den
+    all_idx = np.arange(v.n)
+    S_all = (v.base != A_) & (Xa != A_)
+    out = {**reg, "two_sided_valid": two_sided_ok, "n_answered_by_both_baselines": int(S_all.sum()),
+           "steer_induced_abstention_on_both_answered_intact": float((Xs[S_all] == A_).mean()) if S_all.any() else float("nan"),
+           "steer_induced_abstention_on_both_answered_ablated": float((Xc[S_all] == A_).mean()) if S_all.any() else float("nan")}
+    if not positive_control_passed:
+        out.update({"primary": "untestable", "primary_value": float("nan")})
+        return out
+    bc, bl = S.paired_bootstrap(cond, v.n), S.paired_bootstrap(lo, v.n)
+    out["fraction_removed_conditional"] = {"point": cond(all_idx), **bc}
+    out["fraction_removed_logodds"] = {"point": lo(all_idx), **bl}
+    if two_sided_ok and reg.get("status") == "defined":
+        out.update({"primary": "registered", "primary_value": reg["fraction_removed"],
+                    "primary_ci": [reg.get("ci_low"), reg.get("ci_high")]})
+    else:
+        out.update({"primary": "conditional", "primary_value": out["fraction_removed_conditional"]["point"],
+                    "primary_ci": [bc["ci_low"], bc["ci_high"]]})
+    return out
 
 
 # ----------------------------------------------------------------------------- gated knockout (A7)

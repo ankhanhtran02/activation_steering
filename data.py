@@ -9,7 +9,8 @@ import numpy as np
 
 from config import (DATA_DIR, DATA_FILES, DEV_SUBSET_PER_DECILE, EQ_PER_RELATION, EQ_RELATIONS, N_ADV_HELDOUT,
                     N_ADV_TRAIN, N_ALPACA_BENIGN, N_ALPACA_TRAIN, N_MMLU, N_MMLU_DEV, N_PER_DECILE, N_REF_DEV,
-                    N_REF_TEST, REF_MIN_CHARS, SEED_SPLIT_BASE, SPLIT_FRACTIONS, SPLIT_SALT, TQA_DEV_N, TQA_TEST_N)
+                    N_REF_TEST, PREVIOUSLY_SCORED_PATH, REF_MIN_CHARS, SEED_SPLIT_BASE, SPLIT_FRACTIONS, SPLIT_SALT,
+                    TEST_MAX_PER_DECILE, TQA_DEV_N, TQA_TEST_N)
 
 
 @dataclass
@@ -85,7 +86,20 @@ def _dev_subset(dev_items, seed):
     return sorted(out)
 
 
-def load_popqa(test_n_per_decile):
+def load_previously_scored():
+    """Final F1: question ids scored on a test split by run 1 or run 2 (previously_scored_qids.json)."""
+    keys = ("popqa_test", "entity_questions", "triviaqa")
+    if not PREVIOUSLY_SCORED_PATH.exists():
+        raise FileNotFoundError(f"{PREVIOUSLY_SCORED_PATH} missing: the final run needs it to exclude every "
+                                "question an earlier run scored")
+    d = json.loads(PREVIOUSLY_SCORED_PATH.read_text())
+    return {k: set(d.get(k, [])) for k in keys}
+
+
+def load_popqa():
+    """Train / train_reserve / dev are the registered seed-0 draws (unchanged). Final F1: test is every
+    test-pool question not scored by an earlier run, in the seed-0 permutation order per decile."""
+    prev = load_previously_scored()["popqa_test"]
     rows = read_jsonl(DATA_FILES["popqa"])
     n_raw = len(rows)
     # a few PopQA rows have no subject ("Who is the author of ?"): unanswerable, dropped
@@ -109,7 +123,7 @@ def load_popqa(test_n_per_decile):
 
     rng = np.random.default_rng(0)
     splits = {"train": [], "train_reserve": [], "dev": [], "test": []}
-    shortfall = {}
+    shortfall, fresh_info = {}, {"per_decile_fresh": [], "per_decile_excluded": [], "excluded_max_rank": -1}
     for pool in ["train", "dev", "test"]:
         for d in range(10):
             cand = sorted([it for it in items_by_pool[pool] if it.decile == d], key=lambda x: x.qid)
@@ -122,11 +136,24 @@ def load_popqa(test_n_per_decile):
                 splits["train_reserve"] += perm[n1:n1 + n2]
                 if len(perm) < n1 + n2:
                     shortfall[f"train_d{d}"] = len(perm)
+            elif pool == "dev":
+                splits["dev"] += perm[:N_PER_DECILE["dev"]]
+                if len(perm) < N_PER_DECILE["dev"]:
+                    shortfall[f"dev_d{d}"] = len(perm)
             else:
-                n = N_PER_DECILE["dev"] if pool == "dev" else test_n_per_decile
-                splits[pool] += perm[:n]
-                if len(perm) < n:
-                    shortfall[f"{pool}_d{d}"] = len(perm)
+                excluded = [it for it in perm if it.qid in prev]
+                fresh = [it for it in perm if it.qid not in prev]
+                if TEST_MAX_PER_DECILE is not None:
+                    fresh = fresh[:TEST_MAX_PER_DECILE]
+                splits["test"] += fresh
+                fresh_info["per_decile_fresh"].append(len(fresh))
+                fresh_info["per_decile_excluded"].append(len(excluded))
+                if excluded:
+                    fresh_info["excluded_max_rank"] = max(fresh_info["excluded_max_rank"],
+                                                          max(it.extra["decile_rank"] for it in excluded))
+    assert not any(it.qid in prev for it in splits["test"]), "a previously scored question entered the test set"
+    fresh_info["n_test"] = len(splits["test"])
+    fresh_info["n_previously_scored_in_pool"] = int(sum(fresh_info["per_decile_excluded"]))
     for k in splits:  # fixed, popularity-mixed question order (batches are formed in this order)
         splits[k].sort(key=lambda it: qid_hash(it.qid))
 
@@ -134,7 +161,8 @@ def load_popqa(test_n_per_decile):
     pool_subjects = sorted({it.subj for k in ("train", "dev") for it in items_by_pool[k]})
     return splits, dev_subset, pool_subjects, items_by_pool, {
         "shortfall": shortfall, "decile_edges": dec_edges.tolist(), "tercile_edges": ter_edges.tolist(),
-        "pool_sizes": {k: len(v) for k, v in items_by_pool.items()}, "n_dropped_no_subject": n_raw - len(rows)}
+        "pool_sizes": {k: len(v) for k, v in items_by_pool.items()}, "n_dropped_no_subject": n_raw - len(rows),
+        "fresh_test": fresh_info}
 
 
 def draw_seed_splits(pools, seed):
@@ -190,8 +218,11 @@ def load_entity_questions(excluded_subjects):
                     return True
         return False
 
+    # final F1: questions run 1 / run 2 scored are skipped; the per-relation permutation (and so the rng
+    # stream) is the registered one, so the new items are the next ones in the registered order
+    prev = load_previously_scored()["entity_questions"]
     rng = np.random.default_rng(0)
-    items, n_excluded = [], 0
+    items, n_excluded, n_prev = [], 0, 0
     for rel in EQ_RELATIONS:
         rel_rows = [r for r in rows if r["relation"] == rel]
         subjects = eq_template_subject([r["question"] for r in rel_rows])
@@ -201,11 +232,48 @@ def load_entity_questions(excluded_subjects):
                 n_excluded += 1
             else:
                 kept.append((r, subj))
-        for i in rng.permutation(len(kept))[:EQ_PER_RELATION]:
+        taken = 0
+        for i in rng.permutation(len(kept)):
+            if taken == EQ_PER_RELATION:
+                break
             r, subj = kept[i]
-            items.append(QAItem(qid=f"eq_{rel}_{r['idx']}", question=r["question"], subj=subj,
+            qid = f"eq_{rel}_{r['idx']}"
+            if qid in prev:
+                n_prev += 1
+                continue
+            items.append(QAItem(qid=qid, question=r["question"], subj=subj,
                                 aliases=[a for a in r["answers"] if a.strip()], dataset="eq", prop=rel))
-    return items, {"n_excluded_by_subject_filter": n_excluded}
+            taken += 1
+    return items, {"n_excluded_by_subject_filter": n_excluded, "n_previously_scored_skipped": n_prev}
+
+
+def load_triviaqa():
+    """Amendment A10: TriviaQA rc.nocontext validation; dev 300 (threshold only, as in run 2) / test
+    1,000. Final F1: test skips every question run 2 scored and repeated question ids (the
+    rc.nocontext file lists some questions more than once), and never overlaps dev. Directions are
+    transferred from PopQA, not refit; dev is used only for the threshold tau."""
+    prev = load_previously_scored()["triviaqa"]
+    rows = read_jsonl(DATA_FILES["triviaqa"])
+    rows = sorted(rows, key=lambda r: r["question_id"])
+    perm = np.random.default_rng(0).permutation(len(rows))
+
+    def item(r):
+        al = [a for a in dict.fromkeys(r["aliases"] + [r["value"]]) if a and a.strip()]
+        return QAItem(qid=f"tqa_{r['question_id']}", question=r["question"], aliases=al, dataset="tqa")
+    dev = [item(rows[i]) for i in perm[:TQA_DEV_N]]
+    seen = {it.qid for it in dev} | set(prev)
+    test = []
+    for i in perm[TQA_DEV_N:]:
+        it = item(rows[i])
+        if it.qid in seen:
+            continue
+        seen.add(it.qid)
+        test.append(it)
+        if len(test) == TQA_TEST_N:
+            break
+    for k in (dev, test):
+        k.sort(key=lambda it: qid_hash(it.qid))
+    return {"dev": dev, "test": test}
 
 
 def eq_subset_indices(items, n_total, key="prop", groups=EQ_RELATIONS):
@@ -216,23 +284,6 @@ def eq_subset_indices(items, n_total, key="prop", groups=EQ_RELATIONS):
         idx = [i for i, it in enumerate(items) if getattr(it, key) == rel]
         out += idx[:base + (1 if j < extra else 0)]
     return sorted(out)
-
-
-def load_triviaqa():
-    """Amendment A10: TriviaQA rc.nocontext validation; dev 300 / test 1,000, disjoint (seed 0).
-    Directions are transferred from PopQA, not refit; dev is used only for the threshold tau."""
-    rows = read_jsonl(DATA_FILES["triviaqa"])
-    rows = sorted(rows, key=lambda r: r["question_id"])
-    perm = np.random.default_rng(0).permutation(len(rows))
-
-    def item(r):
-        al = [a for a in dict.fromkeys(r["aliases"] + [r["value"]]) if a and a.strip()]
-        return QAItem(qid=f"tqa_{r['question_id']}", question=r["question"], aliases=al, dataset="tqa")
-    dev = [item(rows[i]) for i in perm[:TQA_DEV_N]]
-    test = [item(rows[i]) for i in perm[TQA_DEV_N:TQA_DEV_N + TQA_TEST_N]]
-    for k in (dev, test):
-        k.sort(key=lambda it: qid_hash(it.qid))
-    return {"dev": dev, "test": test}
 
 
 def tqa_subset_indices(items, n_total):
@@ -288,14 +339,9 @@ def load_mmlu_dev():
     return _stratified_mmlu(read_jsonl(DATA_FILES["mmlu_dev"]), N_MMLU_DEV)
 
 
-def trim_test(items, n_per_decile):
-    """Degradation-ladder step: keep the first n items per decile in sampling order (a prefix of
-    the original draw, so the smaller test set is nested in the larger one)."""
-    return [it for it in items if it.extra["decile_rank"] < n_per_decile]
-
-
-def load_all(test_n_per_decile=N_PER_DECILE["test"]):
-    splits, dev_subset, pool_subjects, pools, popqa_info = load_popqa(test_n_per_decile)
+def load_all():
+    """Final F1: the PopQA test size is fixed by the fresh pool (never cut by the budget ladder)."""
+    splits, dev_subset, pool_subjects, pools, popqa_info = load_popqa()
     eq_items, eq_info = load_entity_questions(pool_subjects)
     tqa = load_triviaqa()
     return {"popqa": splits, "dev_subset": dev_subset, "pools": pools, "eq": eq_items, "tqa": tqa,

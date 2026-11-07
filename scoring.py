@@ -12,12 +12,18 @@ from config import BOOTSTRAP_SEED, N_BOOTSTRAP
 C_, A_, W_ = 1, 0, -1   # outcome codes: correct / abstained / wrong (degenerate counts as wrong)
 STATE_NAMES = {C_: "correct", A_: "abstained", W_: "wrong"}
 
-ABSTENTION_PHRASES = ["i don't know", "i do not know", "i'm not sure", "i am not sure", "not sure",
-                      "i cannot", "i can't", "i'm unable", "i am unable", "unable to",
-                      "i don't have", "no information", "cannot determine", "i'm sorry", "sorry",
-                      "unknown"]
+ABSTENTION_PHRASES_REGISTERED = ["i don't know", "i do not know", "i'm not sure", "i am not sure", "not sure",
+                                 "i cannot", "i can't", "i'm unable", "i am unable", "unable to",
+                                 "i don't have", "no information", "cannot determine", "i'm sorry", "sorry",
+                                 "unknown"]
+SHORT_IDK_PHRASES_REGISTERED = ["i don't know", "i do not know", "unknown"]
+# final F8 (measurement fix): the registered list misses the subject-less forms "Don't know." /
+# "Do not know", which run 2 scored as wrong answers (Qwen: 4-18 per 1,200 depending on the arm,
+# i.e. an arm-dependent bias of up to 1.5 points). They are added; the registered rule is kept as a
+# sensitivity analysis (abstention_type(..., registered=True)).
+ABSTENTION_PHRASES = ABSTENTION_PHRASES_REGISTERED + ["don't know", "do not know", "dont know"]
+SHORT_IDK_PHRASES = SHORT_IDK_PHRASES_REGISTERED + ["don't know", "do not know", "dont know"]
 REFUSAL_PHRASING = ["i'm sorry", "sorry", "i cannot", "i can't", "i'm unable", "unable to"]
-SHORT_IDK_PHRASES = ["i don't know", "i do not know", "unknown"]
 INSTRUCTION_REFUSAL_PHRASES = ["i'm sorry", "i am sorry", "i apologize", "as an ai",
                                "as a language model", "as an assistant", "i cannot", "i can't",
                                "i am unable to", "i'm unable to", "i am not able to",
@@ -62,11 +68,14 @@ def is_degenerate(text):
     return len(tris) != len(set(tris))
 
 
-def abstention_type(text):
-    """None if not an abstention, else 'refusal_phrasing' or 'idk_phrasing'."""
+def abstention_type(text, registered=False):
+    """None if not an abstention, else 'refusal_phrasing' or 'idk_phrasing'. registered=True applies
+    the phrase list of the plan / amendment 2026-11-04 (sensitivity analysis, final F8)."""
     t = light_normalize(text)
-    starts = any(_starts_with_phrase(t, p) for p in ABSTENTION_PHRASES)
-    short_idk = len(t.split()) <= 6 and any(p in t for p in SHORT_IDK_PHRASES)
+    phrases = ABSTENTION_PHRASES_REGISTERED if registered else ABSTENTION_PHRASES
+    short = SHORT_IDK_PHRASES_REGISTERED if registered else SHORT_IDK_PHRASES
+    starts = any(_starts_with_phrase(t, p) for p in phrases)
+    short_idk = len(t.split()) <= 6 and any(p in t for p in short)
     if not (starts or short_idk):
         return None
     return "refusal_phrasing" if any(_starts_with_phrase(t, p) for p in REFUSAL_PHRASING) else "idk_phrasing"
@@ -84,12 +93,12 @@ def alias_match(text, aliases, strict=False):
     return False
 
 
-def classify(text, aliases):
+def classify(text, aliases, registered=False):
     """Order: degenerate -> abstained -> answer (correct / wrong).
     Returns (state, degenerate, abstention subtype, strict-exact correct)."""
     if is_degenerate(text):
         return W_, True, None, False
-    at = abstention_type(text)
+    at = abstention_type(text, registered)
     if at is not None:
         return A_, False, at, False
     if alias_match(text, aliases):
@@ -387,11 +396,21 @@ def make_output(name, gen, items, confidence=None, confidence_kind="answer_logpr
                       gen.ans_logprob, gen.token_ids, extra)
 
 
+WITHDRAWN_PREFIX = "<withdrawn by gate> "
+
+
+def reclassify_states(texts, aliases, registered=True):
+    """States of saved outputs under the registered (or revised) abstention rule; answers withdrawn by
+    a gate stay abstentions (final F8 sensitivity analysis; no generation needed)."""
+    return np.array([A_ if t.startswith(WITHDRAWN_PREFIX) else classify(t, al, registered)[0]
+                     for t, al in zip(texts, aliases)], dtype=np.int8)
+
+
 def policy_output(name, base, states, confidence=None, extra=None):
     """Post-hoc policy on a base output (threshold gate): withdrawn answers become abstentions."""
     states = np.asarray(states, dtype=np.int8)
     withdrawn = (base.states != A_) & (states == A_)
-    texts = [("<withdrawn by gate> " + t) if w else t for t, w in zip(base.texts, withdrawn)]
+    texts = [(WITHDRAWN_PREFIX + t) if w else t for t, w in zip(base.texts, withdrawn)]
     abst = ["gate" if w else a for a, w in zip(base.abst_type, withdrawn)]
     return CondOutput(name, states, base.degenerate & ~withdrawn, base.truncated & ~withdrawn,
                       base.n_tokens, abst, base.strict_correct & (states == C_), texts,

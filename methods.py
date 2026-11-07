@@ -12,7 +12,8 @@ import torch
 
 import model_utils as mu
 from config import (C_GRID, DEV_ELIGIBLE_ABST_INC, DEV_ELIGIBLE_MAX_DEGENERATE, DEV_FALLBACK_TARGET_INC,
-                    DEV_TIE_POINTS, INSTR_MAX_NEW_TOKENS, MIN_CLASS_KNOWN_UNKNOWN, MMLU_CAP_POINTS, PPL_CAP_RATIO)
+                    DEV_TIE_POINTS, INSTR_MAX_NEW_TOKENS, MIN_CLASS_KNOWN_UNKNOWN, MMLU_CAP_POINTS, PPL_CAP_RATIO,
+                    USER_TEMPLATE_FORCE_IDK)
 from scoring import A_, C_, W_, CondOutput, is_instruction_refusal, summary_metrics
 from steering import (Intervention, SteeredQA, between_question_direction, bootstrap_questions,
                       covariance_shaped_direction, diff_of_means, permute_labels_within_question,
@@ -63,6 +64,33 @@ class KnowledgeDirectionSteer(_DirectionSteer):
             known, unknown, _ = self.label_known_unknown()
         R = self.ctx.cache["train"]["resid_last"] if resid_last is None else resid_last
         return {L: unit(diff_of_means(R[:, L], unknown, known)) for L in layers}
+
+    def fit_decomposition(self, layers, known, unknown, relations):
+        """Final F5: is D_ku a knowledge direction or a question-type (relation / template) axis?
+        With mu_r the mean train residual of relation r, the unnormalised D_ku splits exactly into
+          D_between = mean_{unknown} mu_{r(i)} - mean_{known} mu_{r(i)}   (relation composition only)
+          D_within  = mean_{unknown} (h_i - mu_{r(i)}) - mean_{known} (h_i - mu_{r(i)})   (within relation)
+        Returns ({L: unit D_within}, {L: unit D_between}, diagnostics per layer)."""
+        R = self.ctx.cache["train"]["resid_last"]
+        rel = np.asarray(relations, dtype=object)
+        within, between, diag = {}, {}, {}
+        for L in layers:
+            X = R[:, L].float()
+            mu_r = torch.zeros_like(X)
+            for r in np.unique(rel):
+                m = torch.as_tensor(rel == r)
+                mu_r[m] = X[m].mean(0)
+            full = diff_of_means(X, unknown, known)
+            d_b = diff_of_means(mu_r, unknown, known)
+            d_w = full - d_b
+            within[L] = unit(d_w) if d_w.norm() > 0 else unit(full)
+            between[L] = unit(d_b) if d_b.norm() > 0 else unit(full)
+            diag[L] = {"norm_full": float(full.norm()), "norm_within": float(d_w.norm()), "norm_between": float(d_b.norm()),
+                       "between_energy_share": float((d_b.norm() / full.norm()) ** 2) if full.norm() > 0 else float("nan"),
+                       "cos_full_within": float(torch.dot(unit(full), within[L])),
+                       "cos_full_between": float(torch.dot(unit(full), between[L])),
+                       "cos_within_between": float(torch.dot(within[L], between[L]))}
+        return within, between, diag
 
     @staticmethod
     def select_config_on_dev(sweep, layers, caps=None):
@@ -235,6 +263,28 @@ class RefusalDirectionSteer(_DirectionSteer):
         """Last-prompt residual at L_star projected on r_hat (high = refusal-like)."""
         L = self.ctx.frozen["L_star"]
         return (self.ctx.cache[split]["resid_last"][:, L] @ self.ctx.dirs["refusal"][L]).numpy()
+
+
+class ForcedAbstentionDirection:
+    """Final F4, the uniform abstention push: D_force,L = mean over train questions q of
+    [h_L(last prompt token | prompt that instructs abstention) - h_L(last prompt token | base prompt)].
+    Every question contributes to both sides, so question identity, popularity and known/unknown status
+    cancel within each pair: the direction carries "being told to say I don't know" and no knowledge
+    contrast. Steering with it at a dose-matched strength is the placebo that answers "is D_ku's
+    selection better than a push toward abstention that knows nothing about the question?" (H1b)."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def forced_prompts(self, items):
+        return [self.ctx.unsteered.build_prompt(it, USER_TEMPLATE_FORCE_IDK)[0] for it in items]
+
+    def fit(self, layers, split="train"):
+        c = self.ctx
+        forced = mu.prompt_last_residuals(c.model, c.fmt, self.forced_prompts(c.items[split]), layers)
+        base = c.cache[split]["resid_last"][:, layers]
+        diff = (forced - base).mean(0)
+        return {L: unit(diff[j]) for j, L in enumerate(layers)}
 
 
 class DoseMatchedNull:

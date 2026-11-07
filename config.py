@@ -1,23 +1,31 @@
 """Pre-registered constants from experiment_plan.yaml (single source for every module), plus the
-changes filed in preregistration_amendment_2026-11-04.md (marked "amendment Ax")."""
+changes filed in preregistration_amendment_2026-11-04.md (marked "amendment Ax") and in
+preregistration_amendment_2026-11-07_final_run.md (the final, decisive run; marked "final Fx")."""
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data_cache"
+SMOKE = os.environ.get("STEER_SMOKE") == "1"     # CPU smoke test of the code paths only (see smoke_test.py)
+DATA_DIR = Path(os.environ["STEER_DATA_DIR"]) if os.environ.get("STEER_DATA_DIR") else ROOT / "data_cache"
 # Every run writes to its own folder outputs/run_<UTC timestamp>/ (run.sh passes STEER_OUT_DIR and
 # STEER_RUN_ID and points outputs/latest at it); main.py refuses a folder that already holds results.
 OUTPUTS_ROOT = ROOT / "outputs"
 RUN_ID = os.environ.get("STEER_RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 OUT_DIR = Path(os.environ["STEER_OUT_DIR"]) if os.environ.get("STEER_OUT_DIR") else OUTPUTS_ROOT / f"run_{RUN_ID}"
-MANIFEST_PATH = ROOT / "run_manifest.json"
+MANIFEST_PATH = Path(os.environ["STEER_MANIFEST"]) if os.environ.get("STEER_MANIFEST") else ROOT / "run_manifest.json"
 FROZEN_CONFIG_PATH = OUT_DIR / "frozen_config.json"
 RESULTS_PATH = OUT_DIR / "results.json"
 AUDIT_PATH = OUT_DIR / "audit.csv"
 AUDIT_H1A_PATH = OUT_DIR / "audit_h1a.csv"
+JUDGE_DISAGREEMENTS_PATH = OUT_DIR / "judge_disagreements.csv"   # final F9: rows for the human tie-break
+VERDICTS_PATH = OUT_DIR / "verdicts.json"                        # final F12: the decision table
 PER_ITEM_DIR = OUT_DIR / "per_item"                     # amendment A14: every per-item output
 AMENDMENT_PATH = ROOT / "preregistration_amendment_2026-11-04.md"
+FINAL_AMENDMENT_PATH = ROOT / "preregistration_amendment_2026-11-07_final_run.md"
+AMENDMENT_PATHS = [AMENDMENT_PATH, FINAL_AMENDMENT_PATH]
+# final F1: every question id that run 1 or run 2 scored on a test split; the final run never scores them
+PREVIOUSLY_SCORED_PATH = ROOT / "previously_scored_qids.json"
 LOCKFILE_PATH = ROOT / "requirements.lock"
 
 
@@ -80,6 +88,14 @@ DATA_FILES = {"popqa": "popqa.jsonl", "entity_questions": "entity_questions_test
               "mmlu_dev": "mmlu_validation.jsonl", "triviaqa": "triviaqa_validation.jsonl",
               "bbc_news": "bbc_news_2025_05.jsonl"}
 
+# final F9: local LLM judge for every test-split output (not one of the models under test; a third
+# model size, different weights). Pinned like the models; downloaded by setup.py.
+JUDGE = {"name": "qwen25_7b_instruct_judge", "hf_id": "Qwen/Qwen2.5-7B-Instruct",
+         "revision": "a09a35458c702b33eeacc393d103063234e8bc28"}
+JUDGE_BATCH_SIZE = 64
+JUDGE_MAX_NEW_TOKENS = 3
+JUDGE_N_DISAGREEMENT_ROWS = 300      # per model, stratified by condition, for the human tie-break
+
 # ---------------------------------------------------------------- prompts
 SYSTEM_PROMPT = "You are a concise assistant that answers factual questions."
 USER_TEMPLATE_BASE = (
@@ -105,6 +121,15 @@ USER_TEMPLATE_REFERENCE = "Write a short news article with the headline: {title}
 # the period; the first run scored the margin against "I don't know" without it. The canonical
 # reference now carries the period; the margin's abstain term is the log-sum-exp over both written
 # forms, so a steered model that drops the period is still measured against its own abstention.
+# final F4: the uniform abstention push D_force is the mean (within question) of the last-prompt
+# residual under this instruction minus under the base instruction; it carries "being told to
+# abstain" and no known/unknown contrast (every train question contributes once to both sides).
+USER_TEMPLATE_FORCE_IDK = (
+    "Answer the question with only the answer (a name, place, date, or short phrase). "
+    "If you do not know the answer, reply exactly: I don't know.\n"
+    "Question: {question}\n"
+    "Do not answer this question. Reply exactly: I don't know."
+)
 IDK_STRING = "I don't know."
 IDK_VARIANTS = ["I don't know.", "I don't know"]
 LLAMA_DATE_STRING = "26 Jul 2024"
@@ -124,7 +149,11 @@ SAMPLE_SEED = 1234
 # ---------------------------------------------------------------- data
 SPLIT_SALT = "S9-split"
 SPLIT_FRACTIONS = (0.60, 0.20, 0.20)
-N_PER_DECILE = {"train": 100, "train_reserve": 100, "dev": 40, "test": 150}
+# final F1: the PopQA test set is every test-pool question that neither earlier run scored (runs 1
+# and 2 both scored the first 120 per decile of the seed-0 test permutation): 1,715 questions, at
+# least 149 per decile. TEST_MAX_PER_DECILE caps it (None = all; only the smoke test sets a cap).
+N_PER_DECILE = {"train": 100, "train_reserve": 100, "dev": 40}
+TEST_MAX_PER_DECILE = None
 DEV_SUBSET_PER_DECILE = 30          # 300-item coverage-matching dev subset
 DOSE_ITEMS_PER_DECILE = 30          # 300 unsteered-answered test items for the dose analysis
 EQ_PER_RELATION = 25
@@ -133,7 +162,9 @@ EQ_RELATIONS = ["P17", "P19", "P20", "P26", "P36", "P40", "P50", "P69", "P106", 
                 "P407", "P413", "P495", "P740", "P800"]
 EQ_SUBSET_N = 300
 N_ADV_TRAIN, N_ADV_HELDOUT = 128, 100
-N_ALPACA_TRAIN, N_ALPACA_BENIGN = 128, 100
+# final F7: 300 held-out benign Alpaca instructions (was 100; the first 100 are the same items), so
+# H2d's +5-point spillover prediction is testable (run 2: 5/100 vs 0/100, Fisher p ~ 0.06)
+N_ALPACA_TRAIN, N_ALPACA_BENIGN = 128, 300
 PPL_MAX_RESPONSE_TOKENS = 128
 N_MMLU = 500                        # test (side effects), cais/mmlu "all" test split
 N_MMLU_DEV = 300                    # amendment A11: dev cap, cais/mmlu "all" validation split (disjoint)
@@ -149,10 +180,12 @@ TQA_DEV_N, TQA_TEST_N, TQA_SUBSET_N = 300, 1000, 300
 N_SEEDS = 3
 SEED_SPLIT_BASE = 10_000
 SEED_SAMPLE_STRIDE = 1000
+# final F3/F5: the seeded arms are the H1-critical ones (the three old dose-matched nulls are replaced
+# by the dose-matched uniform push D_force; gated steering also runs at its dev-tuned strength)
 SEEDED_CONDITIONS = ["unsteered", "confidence_threshold_margin", "knowledge_dir_steer", "read_dir_steer",
-                     "refusal_dir_steer", "margin_gated_steer_knowledge", "dose_matched_null_shuffled_ku",
-                     "dose_matched_null_cov_random", "dose_matched_null_negated_ku"]
-N_WQ_REFITS = 5                     # D_wq refits (question-level bootstrap of the gray zone, r >= 1)
+                     "refusal_dir_steer", "margin_gated_steer_knowledge", "margin_gated_steer_knowledge_tuned",
+                     "dose_matched_placebo_force"]
+N_WQ_REFITS = 1                     # final: D_wq refits r >= 1 dropped (stability is not a registered question)
 WQ_REFIT_SEED_BASE = 6000
 
 # ---------------------------------------------------------------- steering
@@ -165,10 +198,15 @@ WQ_REFIT_SEED_BASE = 6000
 # 1.5 % of rbar, so the first run's doses 0.1-0.4 rbar are about 7-27 sigma; {2..64} sigma spans
 # about 0.03-0.94 rbar there, and doses that are too large for a model are ineligible on dev.
 C_GRID = [2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
-DOSE_C_GRID = [0.0, 2.0, 4.0, 8.0, 16.0, 32.0, 48.0, 64.0]
+# final F6: the teacher-forced dose response uses a finer grid restricted to doses that are clean on
+# dev at (L*, c) (degenerate <= 5%); run 2 fitted slopes up to 64 sigma where Llama was 100% degenerate
+DOSE_C_GRID = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0]
 COV_MATCH_MULTIPLIERS = [1, 2, 4]
-N_RANDOM_DRAWS = 20
-MIN_RANDOM_DRAWS = 10
+# final F3: 10 norm-matched isotropic draws (registered null of H1b-norm-matched and H4b); run 2 showed
+# they barely move abstention, so the dose-matched placebos below carry H1b
+N_RANDOM_DRAWS = 10
+N_TRANSFER_RANDOM_DRAWS = 0         # final: transfer-set random subsets dropped (uninformative in run 2)
+MIN_RANDOM_DRAWS = 5
 RANDOM_SEED_BASE = 1000
 N_COV_MATCHED_DRAWS = 5
 N_LABEL_PERM_DRAWS = 5
@@ -197,8 +235,30 @@ REFUSAL_ABLATION_VARIANTS = {
     "refusal_dir_mean_ablation": {"mode": "mean", "layers": "all"},
     "refusal_dir_mean_ablation_single_layer": {"mode": "mean", "layers": "single"},
 }
-N_RANDOM_ABLATION_DRAWS = {"refusal_dir_ablation": 5, "refusal_dir_mean_ablation": 3,
-                           "refusal_dir_mean_ablation_single_layer": 3}
+N_RANDOM_ABLATION_DRAWS = {"refusal_dir_ablation": 3, "refusal_dir_mean_ablation": 2,
+                           "refusal_dir_mean_ablation_single_layer": 2}
+
+# final F3: dose-matched placebos for H1b. Each direction is run on the 300-item dev subset at
+# multiples of alpha* (ascending, stop once knowledge_dir_steer's abstention increase is reached or
+# output degenerates > 10%; then one geometric midpoint), and the clean multiple closest to the
+# target is frozen. Matched = within +/- 3 points, compared as item counts (run 2 compared floats and
+# lost a match to 3.0000000000000036). Random directions take the sign that lowers the teacher-forced
+# margin on 64 dev prompts (sign-aligned), so they can push toward abstention at all.
+N_PLACEBO_ISO = 8                    # sign-aligned isotropic random directions
+N_PLACEBO_COV = 4                    # sign-aligned covariance-shaped random directions
+PLACEBO_SEED_BASE = 11000
+PLACEBO_MULTIPLIERS = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+PLACEBO_LOW_MULTIPLIERS = [0.25, 0.125]
+SIGN_PROXY_MULTIPLIER = 2.0
+DOSE_MATCH_TOL_FRAC = 0.03
+# final F10: D_wq at its own scale (c * sigma_{L*}(D_wq)); dev selection = largest net W->C - C->W
+# with degenerate <= 5% and the A11 caps; nulls at the same norm and positions
+WQ_OWN_C_GRID = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+N_WQ_OWN_NULLS = 5
+WQ_OWN_RANDOM_SEED_BASE = 12000
+# final F11: relations whose gold labels are often ambiguous or too narrow (titles shared by several
+# works, genre granularity); a sensitivity analysis excludes them
+AMBIGUOUS_RELATIONS = ("genre", "producer", "director", "screenwriter", "composer", "author")
 
 DEV_ELIGIBLE_MAX_DEGENERATE = 0.05
 DEV_ELIGIBLE_ABST_INC = (5.0, 30.0)  # percentage points
@@ -240,9 +300,9 @@ H2B_MAX_TOP_TERCILE_DAMAGE = 3.0
 # applied all six degradation steps at once, including the 1,500 -> 1,200 test cut. Now: a warm-up
 # batch precedes calibration, the scale is re-estimated from completed work, and every ladder step
 # is decided only when its work is reached, in ladder order (see pipeline.Budget).
-RUN_LIMIT_SECONDS = 10 * 3600
-BUDGET_CAP_SECONDS = int(0.8 * RUN_LIMIT_SECONDS)
-PLAN_ANALYSIS_SECONDS = 600
+RUN_LIMIT_SECONDS = 12 * 3600       # final: expected ~8 h; limit 12 h, cap 11 h
+BUDGET_CAP_SECONDS = 11 * 3600
+PLAN_ANALYSIS_SECONDS = 3600            # analysis + phase D judge (~31k distinct outputs, ~30 min)
 PLAN_GEN_RATE = 25.0                # QA questions / s at <= 16 new tokens, batch 64
 PLAN_INSTR_RATE = 12.0              # instruction prompts / s at 32 new tokens
 PLAN_FWD_RATE = 60.0                # teacher-forced sequences / s
@@ -250,15 +310,15 @@ PLAN_SAMPLE_RATE = 14.0             # prompts / s for 8 samples with shared pref
 CALIB_N_GEN, CALIB_N_FWD = 256, 512
 # Degradation ladder in pre-registered order: (flag, what it cuts). Savings are computed from the
 # work plan in pipeline.Budget; test_1200 is only applied if every earlier step cannot close the gap.
+# final: only work that no verdict depends on can be cut; the fresh test set, the seeds, the
+# dose ladder, the placebos D_force / D_ku decomposition, the judge and the H2 arms are never cut.
 DEGRADATION_LADDER = [
-    "eq_subset_150",
-    "tqa_subset_150",
-    "random_ablation_reduced",
-    "drop_alt_layer",
-    "label_perm_3",
-    "cov_matched_3",
-    "wq_answer_random_1",
-    "test_1200",
+    "instr_random_2",           # instruction-set random draws 5 -> 2
+    "random_ablation_reduced",  # random-direction ablations 7 -> 3
+    "norm_random_5",            # norm-matched isotropic draws on PopQA test 10 -> 5
+    "label_perm_3",             # shared-site label-permuted D_wq 5 -> 3
+    "wq_own_nulls_3",           # own-dose D_wq nulls 5 + 5 -> 3 + 3
+    "placebo_reduced",          # sign-aligned random placebos 8 + 4 -> 4 + 2
 ]
 
 PLANNED_CONDITIONS = [
@@ -267,6 +327,54 @@ PLANNED_CONDITIONS = [
     "margin_gated_steer", "random_dir_placebo",
 ]
 STEERING_CONDITIONS = ["knowledge_dir_steer", "within_question_dir_steer", "refusal_dir_steer"]
-# amendment A3/A9: conditions added to every table (always_abstain is a computed reference row)
-ADDED_CONDITIONS = ["always_abstain", "read_dir_steer", "within_question_dir_steer_answer_positions",
-                    "dose_matched_null", "sample_vote"]
+# amendment A3/A9 and final F3/F5/F10: conditions added to every table
+ADDED_CONDITIONS = ["always_abstain", "read_dir_steer", "dose_matched_placebo", "knowledge_decomposition",
+                    "within_question_dir_steer_own", "sample_vote"]
+
+# ---------------------------------------------------------------- smoke test (CPU, tiny models)
+# STEER_SMOKE=1 runs every code path end to end on two small instruct models and tiny splits. It
+# exists to catch crashes before the GPU run; its numbers mean nothing and are never reported.
+if SMOKE:
+    _sm = os.environ.get("STEER_SMOKE_MODELS", "")
+    MODELS = []
+    for _entry in [e for e in _sm.split(";") if e]:
+        _name, _hf, _rev, _nl, _d, _cand, _ref = _entry.split("|")
+        MODELS.append({"name": _name, "hf_id": _hf, "revision": _rev, "n_layers": int(_nl), "d_model": int(_d),
+                       "steering_candidate_layers": [int(x) for x in _cand.split(",")],
+                       "refusal_candidate_layers": [int(x) for x in _ref.split(",")]})
+    _j = os.environ.get("STEER_SMOKE_JUDGE", "").split("|")
+    if len(_j) == 3:
+        JUDGE = {"name": _j[0], "hf_id": _j[1], "revision": _j[2]}
+    N_PER_DECILE = {"train": 8, "train_reserve": 4, "dev": 4}
+    TEST_MAX_PER_DECILE = 3
+    DEV_SUBSET_PER_DECILE = 3
+    DOSE_ITEMS_PER_DECILE = 2
+    EQ_PER_RELATION = 1
+    TQA_DEV_N, TQA_TEST_N = 20, 24
+    N_ADV_TRAIN, N_ADV_HELDOUT = 12, 8
+    N_ALPACA_TRAIN, N_ALPACA_BENIGN = 12, 8
+    N_MMLU, N_MMLU_DEV = 20, 16
+    N_REF_DEV, N_REF_TEST = 6, 6
+    REF_MIN_CHARS = 100
+    PPL_MAX_RESPONSE_TOKENS = 32
+    QA_MAX_NEW_TOKENS, INSTR_MAX_NEW_TOKENS = 8, 8
+    BATCH_SIZE, SAMPLE_BATCH_PROMPTS = 16, 8
+    N_LABEL_SAMPLES = 8
+    N_SEEDS = 2
+    C_GRID = [2.0, 8.0, 32.0]
+    DOSE_C_GRID = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+    WQ_OWN_C_GRID = [2.0, 8.0, 32.0]
+    N_RANDOM_DRAWS, N_INSTR_RANDOM_DRAWS, N_PPL_RANDOM_DRAWS = 3, 2, 2
+    N_RANDOM_ABLATION_DRAWS = {"refusal_dir_ablation": 1, "refusal_dir_mean_ablation": 1,
+                               "refusal_dir_mean_ablation_single_layer": 1}
+    N_LABEL_PERM_DRAWS = 2
+    N_PLACEBO_ISO, N_PLACEBO_COV = 2, 1
+    PLACEBO_MULTIPLIERS = [0.5, 2.0, 8.0]
+    N_WQ_OWN_NULLS = 2
+    MIN_CLASS_KNOWN_UNKNOWN, MIN_GRAY_QUESTIONS, MIN_GRAY_AFTER_TOPUP = 3, 3, 2
+    DIAG_N_PROMPTS = 8
+    N_BOOTSTRAP, N_PERMUTATIONS, N_COSINE_NULL = 200, 500, 100
+    CALIB_N_GEN, CALIB_N_FWD = 16, 32
+    AUDIT_PER_MODEL, AUDIT_ROWS_PER_CELL, JUDGE_N_DISAGREEMENT_ROWS = 20, 5, 20
+    JUDGE_BATCH_SIZE = 8
+    N_SPLIT_RESAMPLES = 2

@@ -172,6 +172,21 @@ Refinement log
   - A14 reproducibility: pinned model and dataset revisions, data checksums verified at start,
     CODE_HASH / AMENDMENT / LOCKFILE lines, requirements.lock written by run.sh, every per-item
     output saved under <run folder>/per_item/.
+  2026-11-07 (final, decisive run; amendment file preregistration_amendment_2026-11-07_final_run.md):
+  - F1 fresh data: PopQA test = the 1,715 test-pool questions no earlier run scored (excluded ids in
+    previously_scored_qids.json; never cut by the budget); fresh EntityQuestions and TriviaQA items too.
+  - F2 H1c re-specified: gated steering at its own dev-tuned strength (max dev S1 of gated steering).
+  - F3-F5 H1b: dose-matched comparison arms on dev (integer-count matching): the uniform abstention
+    push D_force (within-question CAA of "reply I don't know"), D_ku split into within- and
+    between-relation parts, sign-aligned isotropic and covariance-shaped random directions.
+  - F6 H1e on the dev-clean dose range with |mean| CV; F7 H2 ablation variants at one L_ref, two-sided
+    H2c validity and a conditional / log-odds H2c, 300 benign prompts; F8 "Don't know." counted as an
+    abstention (registered rule kept as sensitivity); F9 local LLM judge for every test output (phase
+    D) with a disagreement file; F10 D_wq at its own dose; F11 H3 pre-specified signal (dev AUROC),
+    cross-fitted projections, registered comparator primary; F12 verdict table (verdicts.json);
+    kill rule changed: screening verdicts are acted on without a 7-9B confirmation.
+  - Dropped as settled or uninformative: answer-position D_wq, position / alt-layer / between-question
+    ablations, D_wq refits and shared-norm ladder, the three run-2 nulls, transfer-set random subsets.
   - Run infrastructure (no effect on the protocol): every run writes to its own folder
     outputs/run_<UTC timestamp>/ (run.sh sets STEER_OUT_DIR / STEER_RUN_ID, outputs/latest points
     to the newest, main.py refuses a folder that already holds results; first-run files in outputs/
@@ -196,9 +211,12 @@ import numpy as np
 import torch
 
 import data as D
+import judge as J
 import report
-from config import (ADDED_CONDITIONS, AMENDMENT_PATH, FROZEN_CONFIG_PATH, GLOBAL_SEED, LOCKFILE_PATH, MANIFEST_PATH,
-                    MODELS, OUT_DIR, PLANNED_CONDITIONS, RESULTS_PATH, ROOT, RUN_ID)
+import verdicts as V
+from config import (ADDED_CONDITIONS, AMENDMENT_PATHS, FROZEN_CONFIG_PATH, GLOBAL_SEED, JUDGE, LOCKFILE_PATH,
+                    MANIFEST_PATH, MODELS, OUT_DIR, PLANNED_CONDITIONS, PREVIOUSLY_SCORED_PATH, RESULTS_PATH, ROOT,
+                    RUN_ID, SMOKE)
 from pipeline import Budget, ModelRunner, Timer
 from scoring import abstention_score
 from steering import assert_no_hooks
@@ -206,33 +224,28 @@ from steering import assert_no_hooks
 METRIC_DESC = ("mean over PopQA test questions of +1 correct, 0 abstained, -lambda wrong (lambda=1; "
                "degenerate counts as wrong), in points x100, pooled over both models")
 
+# Phase B order matters: the knowledge dose ladder precedes margin_gated_steer (final F2 composes the
+# tuned gated arm from it), and every H1-critical arm runs before the H4 arms.
 REGISTRY = {
     "unsteered": lambda r: r.cond_unsteered(),
     "confidence_prompt": lambda r: r.cond_confidence_prompt(),
     "confidence_threshold_margin": lambda r: r.cond_confidence_threshold_margin(),
     "popularity_gate": lambda r: r.cond_popularity_gate(),
     "knowledge_dir_steer": lambda r: r.cond_knowledge_dir_steer(),
+    "knowledge_dir_steer_dose_ladder": lambda r: r.cond_knowledge_dose_ladder(),
     "within_question_dir_steer": lambda r: r.cond_within_question_dir_steer(),
     "refusal_dir_steer": lambda r: r.cond_refusal_dir_steer(),
     "margin_gated_steer": lambda r: r.cond_margin_gated_steer(),
-    "random_dir_placebo": lambda r: r.cond_random_dir_placebo(),
-    # amendment A3 / A9
     "always_abstain": lambda r: r.cond_always_abstain(),
     "read_dir_steer": lambda r: r.cond_read_dir_steer(),
-    "within_question_dir_steer_answer_positions": lambda r: r.cond_wq_answer_positions(),
-    "dose_matched_null": lambda r: r.cond_dose_matched_null(),
+    "dose_matched_placebo": lambda r: r.cond_dose_matched_placebo(),       # final F3-F5
+    "random_dir_placebo": lambda r: r.cond_random_dir_placebo(),
+    "within_question_dir_steer_own": lambda r: r.cond_wq_own(),           # final F10
     "sample_vote": lambda r: r.cond_sample_vote(),
 }
 
 ABLATIONS = {
-    "knowledge_dir_steer_dose_ladder": lambda r: r.abl_knowledge_dose_ladder(),
-    "within_question_dir_steer_dose_ladder": lambda r: r.abl_within_question_dose_ladder(),
-    "knowledge_dir_steer_last_prompt_only": lambda r: r.abl_knowledge_last_prompt_only(),
-    "knowledge_dir_steer_generated_only": lambda r: r.abl_knowledge_generated_only(),
-    "knowledge_dir_steer_alt_layer": lambda r: r.abl_knowledge_alt_layer(),
-    "between_question_answer_dir_steer": lambda r: r.abl_between_question_answer_dir(),
     "label_permuted_wq_dir_steer": lambda r: r.abl_label_permuted_wq(),
-    "random_dir_placebo_coverage_matched": lambda r: r.abl_random_coverage_matched(),
     "refusal_dir_ablation": lambda r: r.abl_refusal_ablation(),
     "refusal_dir_ablation_plus_knowledge_steer": lambda r: r.abl_refusal_ablation_plus_knowledge(),
     "random_dir_ablation": lambda r: r.abl_random_ablation(),
@@ -259,8 +272,8 @@ def sha256_file(path):
 
 def code_hash():
     """Amendment A14: hash of every file that defines the run (sources, plan, amendment, lockfile)."""
-    files = sorted(ROOT.glob("*.py")) + [ROOT / "experiment_plan.yaml", AMENDMENT_PATH, ROOT / "requirements.txt",
-                                         LOCKFILE_PATH, ROOT / "run.sh"]
+    files = sorted(ROOT.glob("*.py")) + [ROOT / "experiment_plan.yaml", *AMENDMENT_PATHS, PREVIOUSLY_SCORED_PATH,
+                                         ROOT / "requirements.txt", LOCKFILE_PATH, ROOT / "run.sh"]
     h = hashlib.sha256()
     used = []
     for p in files:
@@ -313,14 +326,8 @@ def phase_a(spec, data, budget, timer, first):
 
 
 def freeze_all(runners, budget, hashes):
-    """Amendment A2: one write of frozen_config.json for every model and seed, then unlock."""
-    full = budget.allow("test_1200") if runners else True
-    if not full:
-        trimmed = D.trim_test(runners[0].data["popqa"]["test"], budget.test_per_decile)
-        runners[0].data["popqa"]["test"] = trimmed
-        for r in runners:
-            r.restrict_test(trimmed)
-        print(f"BUDGET: PopQA test reduced to {len(trimmed)} questions (last ladder rung)", flush=True)
+    """Amendment A2: one write of frozen_config.json for every model and seed, then unlock. Final F1:
+    the test set is never trimmed (the fresh items are the point of this run)."""
     all_frozen = {"_run": {**hashes, "n_test": len(runners[0].items["test"]) if runners else 0}}
     for r in runners:
         all_frozen[r.name] = r.frozen_entry()
@@ -387,20 +394,36 @@ def main():
         raise FileNotFoundError("run_manifest.json missing: run setup.py (with network) before main.py")
     manifest = json.loads(MANIFEST_PATH.read_text())
     ch, files = code_hash()
-    hashes = {"code_sha256": ch, "code_files": files, "amendment_sha256": sha256_file(AMENDMENT_PATH),
+    hashes = {"code_sha256": ch, "code_files": files,
+              "amendment_sha256": {p.name: sha256_file(p) for p in AMENDMENT_PATHS},
+              "previously_scored_sha256": sha256_file(PREVIOUSLY_SCORED_PATH),
               "lockfile_sha256": sha256_file(LOCKFILE_PATH)}
     print(f"CODE_HASH: sha256={ch} files={len(files)}", flush=True)
-    print(f"AMENDMENT: {AMENDMENT_PATH.name} sha256={hashes['amendment_sha256']}", flush=True)
+    for p in AMENDMENT_PATHS:
+        if not p.exists():
+            raise FileNotFoundError(f"{p} missing: the run is tied to both amendment files")
+        print(f"AMENDMENT: {p.name} sha256={hashes['amendment_sha256'][p.name]}", flush=True)
     print(f"LOCKFILE: {LOCKFILE_PATH.name} sha256={hashes['lockfile_sha256']}", flush=True)
+    if SMOKE:
+        print("SMOKE_TEST: tiny models and splits on CPU; nothing from this run is a result", flush=True)
     for spec in MODELS:
         rev = manifest["models"][spec["name"]]["revision"]
         if rev != spec["revision"]:
             raise RuntimeError(f"{spec['name']}: downloaded revision {rev} != pinned {spec['revision']}: rerun setup.py")
         print(f"MODEL_REVISION: {spec['name']} {spec['hf_id']}@{rev}", flush=True)
+    jrev = manifest.get("judge", {}).get("revision")
+    if jrev != JUDGE["revision"]:
+        raise RuntimeError(f"judge {JUDGE['hf_id']}: downloaded revision {jrev} != pinned {JUDGE['revision']}: rerun setup.py")
+    print(f"JUDGE_REVISION: {JUDGE['hf_id']}@{jrev}", flush=True)
     hashes["data_sha256"] = check_data(manifest)
 
     data = D.load_all()
-    print(f"DATA: {json.dumps(data['info']['sizes'])} eq_excluded={data['info']['eq']['n_excluded_by_subject_filter']}", flush=True)
+    fr = data["info"]["popqa"]["fresh_test"]
+    print(f"DATA: {json.dumps(data['info']['sizes'])} eq_excluded={data['info']['eq']['n_excluded_by_subject_filter']} "
+          f"eq_previously_scored_skipped={data['info']['eq']['n_previously_scored_skipped']}", flush=True)
+    print(f"TEST_FRESHNESS: popqa_test={fr['n_test']} per_decile={fr['per_decile_fresh']} "
+          f"previously_scored_excluded={fr['n_previously_scored_in_pool']} (max excluded decile rank "
+          f"{fr['excluded_max_rank']}) overlap_with_earlier_runs=0", flush=True)
     budget = Budget(timer, [s["name"] for s in MODELS], len(data["popqa"]["test"]))
     runners = []
     for i, spec in enumerate(MODELS):
@@ -430,6 +453,17 @@ def main():
     for r in runners:
         phase_c(r, timer)
 
+    # phase D (final F9): local LLM judge over every distinct test-split output; a failure leaves the
+    # automatic labels in place and marks every verdict's judge-robustness check as unavailable
+    judge_info = {"status": "not run"}
+    try:
+        judge_info = J.run_judge(runners, timer)
+    except Exception as e:
+        judge_info = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+        print(f"JUDGE_FAILED: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc(file=sys.stderr)
+    timer.mark("judge")
+
     analyses = []
     for r in runners:
         try:
@@ -441,17 +475,25 @@ def main():
                                             for n, o in report.all_test_outputs(r).items()}, "hypotheses": {}})
     timer.mark("analysis")
     summary, paired = report.print_report(runners, analyses, list(REGISTRY))
-    for writer in (report.write_samples, report.write_audit, report.write_audit_h1a, report.write_per_item):
+    verdict_table = {}
+    try:
+        verdict_table = V.compute_verdicts(runners, analyses, paired, judge_info)
+        V.print_verdicts(verdict_table)
+        V.write_verdicts(verdict_table)
+    except Exception as e:
+        fail("verdicts", "all", e)
+    for writer in (report.write_samples, report.write_audit, report.write_audit_h1a, report.write_per_item,
+                   report.write_judge_disagreements):
         try:
             writer(runners)
         except Exception as e:
             fail(writer.__name__, "all", e)
     meta = {"run_id": RUN_ID, "output_dir": str(OUT_DIR), "manifest": manifest, "data_info": data["info"],
-            "time_log": timer.log, "hashes": hashes,
+            "time_log": timer.log, "hashes": hashes, "smoke_test": SMOKE, "judge": judge_info,
             "budget": {"flags": budget.flags, "decided": budget.decided, "history": budget.history},
             "frozen_config_sha256": {k: v.get("sha256") for k, v in all_frozen.items() if isinstance(v, dict)},
             "registered_conditions": list(REGISTRY), "ablations": list(ABLATIONS)}
-    report.write_results(runners, analyses, summary, paired, meta)
+    report.write_results(runners, analyses, summary, paired, meta, verdict_table)
     timer.mark("total")
 
 

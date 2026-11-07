@@ -16,7 +16,7 @@ import urllib.request
 import zipfile
 from importlib import metadata
 
-from config import DATA_DIR, DATA_FILES, DATASET_PINS, EQ_RELATIONS, MANIFEST_PATH, MODELS
+from config import DATA_DIR, DATA_FILES, DATASET_PINS, EQ_RELATIONS, JUDGE, MANIFEST_PATH, MODELS
 
 
 def write_jsonl(path, rows):
@@ -56,20 +56,26 @@ def load_hf(key, split=None):
     return load_dataset(*args, split=split or pin["split"], revision=pin["revision"])
 
 
-def download_models():
+def _snapshot(spec):
     from huggingface_hub import snapshot_download
-    revisions = {}
-    for spec in MODELS:
-        path = snapshot_download(
-            spec["hf_id"], revision=spec["revision"],
-            allow_patterns=["*.json", "*.jinja", "*.safetensors", "tokenizer*", "*.model", "*.txt"],
-            token=os.environ.get("HF_TOKEN"))
-        got = os.path.basename(path)
-        if got != spec["revision"]:
-            raise RuntimeError(f"{spec['hf_id']}: snapshot {got} != pinned revision {spec['revision']}")
-        revisions[spec["name"]] = {"hf_id": spec["hf_id"], "revision": got}
-        print(f"model {spec['hf_id']} @ {got}")
-    return revisions
+    path = snapshot_download(
+        spec["hf_id"], revision=spec["revision"],
+        allow_patterns=["*.json", "*.jinja", "*.safetensors", "tokenizer*", "*.model", "*.txt"],
+        token=os.environ.get("HF_TOKEN"))
+    got = os.path.basename(path)
+    if got != spec["revision"]:
+        raise RuntimeError(f"{spec['hf_id']}: snapshot {got} != pinned revision {spec['revision']}")
+    print(f"model {spec['hf_id']} @ {got}")
+    return {"hf_id": spec["hf_id"], "revision": got}
+
+
+def download_models():
+    return {spec["name"]: _snapshot(spec) for spec in MODELS}
+
+
+def download_judge():
+    """Final F9: the pinned local judge model (about 15 GB in bf16)."""
+    return {"name": JUDGE["name"], **_snapshot(JUDGE)}
 
 
 def download_popqa():
@@ -174,7 +180,8 @@ def main():
         with open(path, encoding="utf-8") as f:
             n = sum(1 for _ in f)
         datasets[key] = {"file": path.name, "source": source_of(key), "sha256": sha256_file(path), "n_rows": n}
-    manifest = {"models": download_models(), "datasets": datasets, "versions": library_versions()}
+    manifest = {"models": download_models(), "judge": download_judge(), "datasets": datasets,
+                "versions": library_versions()}
     with open(MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"wrote {MANIFEST_PATH}")

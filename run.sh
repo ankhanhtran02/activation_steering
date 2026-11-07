@@ -176,7 +176,7 @@ ln -sfn "run_${RUN_ID}" "$OUT_ROOT/latest"
 for f in requirements.lock run_manifest.json; do [ -f "$f" ] && cp "$f" "$RUN_DIR/"; done
 [ -n "$SETUP_LOG" ] && cp "$SETUP_LOG" "$RUN_DIR/setup_log.txt"
 
-say "Running main.py into $RUN_DIR (offline; about 7-8 hours, hard limit 10 hours)"
+say "Running main.py into $RUN_DIR (offline; final run about 8 hours, hard limit 12 hours)"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
 export STEER_OUT_DIR="$PWD/$RUN_DIR" STEER_RUN_ID="$RUN_ID"
 START=$(date +%s)

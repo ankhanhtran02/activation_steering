@@ -3,12 +3,27 @@
 Screening-tier experiment from `experiment_plan.yaml`: *does hallucination steering beat its own
 detector?* Two frozen ~3B instruction models (Llama-3.2-3B-Instruct, Qwen2.5-3B-Instruct) are
 steered at inference time with difference-of-means directions and compared against a confidence
-threshold, a confidence prompt, a popularity gate and 20 norm-matched random directions on PopQA,
-with EntityQuestions and TriviaQA as transfer sets. No model is trained or fine-tuned.
+threshold, a confidence prompt, a popularity gate, norm-matched and dose-matched placebo directions
+on PopQA, with EntityQuestions and TriviaQA as transfer sets. No model is trained or fine-tuned.
 
 The protocol is `experiment_plan.yaml` as amended by `preregistration_amendment_2026-11-04.md`
-(corrected statistics, freeze-before-test ordering, seeds, added controls, pinned data). The
-changes are summarised in the "Refinement log" at the top of `main.py`.
+(corrected statistics, freeze-before-test ordering, seeds, added controls, pinned data) and by
+`preregistration_amendment_2026-11-07_final_run.md` (the final, decisive run). The changes are
+summarised in the "Refinement log" at the top of `main.py`.
+
+## The final run (2026-11-07) in one paragraph
+
+It scores 1,715 PopQA test questions that no earlier run has seen (`previously_scored_qids.json`),
+re-specifies H1c, gives H1b real dose-matched placebos (a uniform "say I don't know" push, sign-aligned
+random directions, and D_ku split into within- and between-relation parts), tests H1a along the whole
+dose ladder, fixes H1e, H2c and the "Don't know." scoring bug, runs D_wq at its own dose, pre-specifies
+H3's signal, and labels every test output with a local judge (Qwen2.5-7B-Instruct). It ends with a
+verdict per hypothesis (`VERDICT:` lines, `verdicts.json`) under the amended kill rule: both 3B families
+decide, with no 7-9B confirmation gate. Expected wall time about 8 hours on the GB10 (limit 12 h).
+`bash run.sh` re-runs setup first, which adds the judge model (~15 GB) to the cache.
+
+Before the GPU run, `python smoke_test.py` runs every code path on CPU with two small instruct models
+and tiny splits (about 30-60 minutes; its numbers mean nothing).
 
 ## Quick start (one command)
 
@@ -24,7 +39,7 @@ That is the whole procedure. `run.sh` will:
 2. download both models and all datasets at their pinned revisions (`setup.py`, about 15-25 min,
    ~13 GB; files already at their pinned source are skipped);
 3. check that the GPU works in bf16 and that every file is in place;
-4. run the experiment offline (`main.py`, about 7-8 hours, hard limit 10 hours) and save logs and
+4. run the experiment offline (`main.py`, final run about 8 hours, hard limit 12 hours) and save logs and
    results to a new folder `outputs/run_<UTC timestamp>/` (`outputs/latest` points to it).
 
 The run takes hours, so start it so that it survives a closed terminal or SSH session:
@@ -119,6 +134,8 @@ per-run folders; its files stay directly in `outputs/`.
 
 | File | Contents |
 |---|---|
+| `verdicts.json` | final run: verdict per hypothesis and model, combined verdicts, label robustness, decision rules |
+| `judge_disagreements.csv` | final run: up to 300 rows per model where the judge and the automatic label disagree, with an empty `human_label` column (the tie-break for a label-sensitive verdict) |
 | `run_log.txt` | full console output, including every harness line |
 | `setup_log.txt`, `run_manifest.json` | copies of this run's setup log (if setup ran in the same call) and of the manifest |
 | `run_stderr.txt` | library warnings and tracebacks of any failed condition |

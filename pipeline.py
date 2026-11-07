@@ -2,12 +2,14 @@
 
 Phase A (pre-test, every model and every seed): unsteered labelling of train/dev, refusal direction
 and positive controls, direction fitting and diagnostics, dev sweeps with the MMLU / perplexity
-caps, thresholds, dose-matched nulls, the answer-position D_wq ladder and the TriviaQA threshold.
+caps, thresholds, the dev-tuned gated strength (final F2), the dose-matched placebos (final F3-F5),
+the own-dose D_wq ladder (final F10) and the TriviaQA threshold.
 Freeze: main.py writes frozen_config.json once for all models and only then unlocks the test splits
 (amendment A2: in the first run model 2 was frozen after model 1's test passes and every model's
 unsteered test passes ran before its own freeze, so the "written before any test forward pass" log
-line was false). Phase B: test labelling, integrity checks, registered conditions, seed arms.
-Phase C: ablations, EntityQuestions, TriviaQA, side effects.
+line was false). Phase B: test labelling, integrity checks, registered conditions (incl. the
+knowledge dose ladder, which H1a's coverage sweep and the tuned H1c need), seed arms.
+Phase C: ablations, EntityQuestions, TriviaQA, side effects. Phase D (main.py): the LLM judge.
 """
 import copy
 import hashlib
@@ -22,24 +24,33 @@ import model_utils as mu
 from baselines import (ConfidencePromptQA, ConfidenceThreshold, PopularityGate, RandomDirectionPlacebo,
                        SampleVoteQA, UnsteeredQA)
 from config import (BATCH_SIZE, BUDGET_CAP_SECONDS, C_GRID, CALIB_N_FWD, CALIB_N_GEN, CONFIDENCE_PROMPT_INSTANCES,
-                    COV_MATCH_MAX_DEGENERATE, COV_MATCH_MULTIPLIERS, DEGRADATION_LADDER, DEV_ELIGIBLE_MAX_DEGENERATE,
-                    DEV_TIE_POINTS, DIAG_N_PROMPTS, DOSE_C_GRID, DOSE_ITEMS_PER_DECILE, DOSE_MATCH_TOL,
-                    EQ_SUBSET_N, LABEL_PERM_SEED_BASE, LAMBDA_PRIMARY, LAMBDAS,
-                    MIN_GRAY_AFTER_TOPUP, MIN_GRAY_QUESTIONS, MIN_RANDOM_DRAWS, MMLU_CAP_POINTS, N_COV_MATCHED_DRAWS,
-                    N_INSTR_RANDOM_DRAWS, N_LABEL_PERM_DRAWS, N_PPL_RANDOM_DRAWS, N_RANDOM_ABLATION_DRAWS,
-                    N_RANDOM_DRAWS, N_SEEDS, N_WQ_ANSWER_RANDOM, N_WQ_REFITS, NO_OP_MAX_FRAC_CHANGED, NO_OP_MAX_KL,
-                    NULL_MULTIPLIERS, NULL_TYPES, PLAN_ANALYSIS_SECONDS, PLAN_FWD_RATE, PLAN_GEN_RATE,
-                    PLAN_INSTR_RATE, PLAN_SAMPLE_RATE, PPL_CAP_RATIO, PPL_MAX_RESPONSE_TOKENS, QA_MAX_NEW_TOKENS,
-                    RANDOM_ABLATION_SEED_BASE, RANDOM_SEED_BASE, REFUSAL_ABLATION_VARIANTS, RUN_LIMIT_SECONDS,
-                    TQA_SUBSET_N, USER_TEMPLATE_MMLU, USER_TEMPLATE_REFERENCE, WQ_ANSWER_C_GRID,
-                    WQ_ANSWER_RANDOM_SEED_BASE, WQ_REFIT_SEED_BASE, ZERO_VECTOR_MIN_IDENTICAL)
+                    COV_MATCH_MAX_DEGENERATE, DEGRADATION_LADDER, DEV_ELIGIBLE_MAX_DEGENERATE,
+                    DEV_TIE_POINTS, DIAG_N_PROMPTS, DOSE_C_GRID, DOSE_ITEMS_PER_DECILE, DOSE_MATCH_TOL_FRAC,
+                    EQ_SUBSET_N, TQA_SUBSET_N, LABEL_PERM_SEED_BASE, LAMBDA_PRIMARY, LAMBDAS, MIN_GRAY_AFTER_TOPUP, MIN_GRAY_QUESTIONS,
+                    MMLU_CAP_POINTS, N_ALPACA_BENIGN, N_ADV_HELDOUT, N_INSTR_RANDOM_DRAWS, N_LABEL_PERM_DRAWS,
+                    N_PLACEBO_COV, N_PLACEBO_ISO, N_PPL_RANDOM_DRAWS, N_RANDOM_ABLATION_DRAWS, N_RANDOM_DRAWS,
+                    N_SEEDS, N_TRANSFER_RANDOM_DRAWS, N_WQ_OWN_NULLS, N_WQ_REFITS, NO_OP_MAX_FRAC_CHANGED,
+                    NO_OP_MAX_KL, PLACEBO_LOW_MULTIPLIERS, PLACEBO_MULTIPLIERS, PLACEBO_SEED_BASE,
+                    PLAN_ANALYSIS_SECONDS, PLAN_FWD_RATE, PLAN_GEN_RATE, PLAN_INSTR_RATE, PLAN_SAMPLE_RATE,
+                    PPL_CAP_RATIO, PPL_MAX_RESPONSE_TOKENS, QA_MAX_NEW_TOKENS, RANDOM_ABLATION_SEED_BASE,
+                    RANDOM_SEED_BASE, REFUSAL_ABLATION_VARIANTS, RUN_LIMIT_SECONDS, SIGN_PROXY_MULTIPLIER,
+                    USER_TEMPLATE_MMLU, USER_TEMPLATE_REFERENCE, WQ_OWN_C_GRID, WQ_OWN_RANDOM_SEED_BASE,
+                    WQ_REFIT_SEED_BASE, ZERO_VECTOR_MIN_IDENTICAL)
 from data import draw_seed_splits, eq_subset_indices, qid_hash, tqa_subset_indices
-from methods import (DoseMatchedNull, KnowledgeDirectionSteer, MarginGatedSteer, ReadDirectionSteer,
+from methods import (ForcedAbstentionDirection, KnowledgeDirectionSteer, MarginGatedSteer, ReadDirectionSteer,
                      RefusalDirectionSteer, WithinQuestionDirectionSteer)
 from scoring import (A_, C_, W_, abstention_score, apply_threshold, fit_threshold, make_output, normalize_answer,
                      policy_output, spearman)
-from steering import (Intervention, SteeredQA, cosine, direction_diagnostics, mean_norms,
+from steering import (Intervention, SteeredQA, cosine, covariance_shaped_direction, direction_diagnostics, mean_norms,
                       measure_mean_projections, projection_sd, random_unit_directions, steer, unit)
+
+# final F3-F5: test-condition names of the dose-matched arms
+PLACEBO_CONDITION = {"force": "dose_matched_placebo_force", "ku_within_relation": "knowledge_dir_steer_within_relation",
+                     "ku_between_relation": "knowledge_dir_steer_between_relation"}
+
+
+def placebo_condition_name(p):
+    return PLACEBO_CONDITION.get(p, f"dose_matched_placebo_{p}")
 
 SHARED_SPLITS = ("test", "eq", "tqa", "tqa_dev")    # never change with the seed
 TEST_SPLITS = ("test", "eq", "tqa")                  # locked until every model's config is frozen
@@ -61,42 +72,40 @@ class Timer:
 
 
 def plan_costs(n_test, n_seeds=N_SEEDS):
-    """Planned seconds per model at the plan rates (amendment A13), by step, and ladder savings."""
+    """Planned seconds per model at the plan rates, by step, and ladder savings (final run work plan;
+    the Budget rescales them by the measured ratio of actual to planned time)."""
     g, i, f, s = (lambda n: n / PLAN_GEN_RATE), (lambda n: n / PLAN_INSTR_RATE), (lambda n: n / PLAN_FWD_RATE), \
         (lambda n: n / PLAN_SAMPLE_RATE)
-    nC, nW = len(C_GRID), len(WQ_ANSWER_C_GRID)
+    nC = len(C_GRID)
+    n_plac = 3 + N_PLACEBO_ISO + N_PLACEBO_COV
     dev_sweep = nC * 3 * g(400) + 6 * f(500) + nC * 3 * f(DIAG_N_PROMPTS)
-    nulls = len(NULL_TYPES) * len(NULL_MULTIPLIERS) * g(300) + g(300)
-    pretest = (f(2 * 1400) + g(1400) + f(2500) + s(1400) + f(1400) + f(1400) + 0.5 * (g(1000) + s(1000))
-               + f(256) + i(200) + i(3 * 4 * 100) + f(4 * 128) + dev_sweep + nC * 3 * g(400) + nC * g(400)
-               + N_COV_MATCHED_DRAWS * 3 * g(300) + g(300) + nulls + nW * 3 * g(400) + nW * N_WQ_ANSWER_RANDOM * g(300)
-               + f(2 * 300) + g(300) + f(500))
-    pretest_seed = f(2 * 1400) + g(1400) + s(1000) + dev_sweep + nulls
+    match = lambda n: n * (4.5 * g(300) + 3 * f(DIAG_N_PROMPTS))        # dose matching on the dev subset
+    labelling = f(2 * 1400) + g(1400) + f(2500) + s(1400) + f(1400) + f(1400) + 0.5 * (g(1000) + s(1000))
+    refusal = f(256) + i(200) + i(4 * 100) + i(2 * 100) + f(2 * 128)
+    pretest = (labelling + refusal + dev_sweep + f(1000) + match(n_plac) + len(WQ_OWN_C_GRID) * g(400) + 2 * f(500)
+               + f(256) + g(300) + f(8 * 400) + f(500))
+    pretest_seed = f(2 * 1400) + g(1400) + s(1000) + dev_sweep + f(1000) + match(1)
     steered = lambda n: g(n) + 2 * f(n)
-    test = (f(2 * n_test) + g(n_test) + f(2.5 * n_test) + s(n_test) + f(n_test)
-            + f(1200) + g(600) + f(1500) + f(2600) + g(1300)
-            + g(n_test) + f(2 * DIAG_N_PROMPTS)
-            + 2 * g(n_test) + 4 * steered(n_test) + (N_WQ_REFITS - 1) * g(n_test) + N_WQ_REFITS * g(n_test)
-            + N_WQ_ANSWER_RANDOM * g(n_test) + len(NULL_TYPES) * g(n_test) + f(8 * (n_test + 400)) + s(400)
-            + N_RANDOM_DRAWS * g(n_test)
-            + (n_seeds - 1) * (3 * steered(n_test) + len(NULL_TYPES) * g(n_test)))
+    test = (f(2 * n_test) + g(n_test) + f(2.5 * n_test) + s(n_test) + f(n_test)      # test labelling
+            + f(2 * 1600) + g(1600) + f(1500)                                       # EntityQuestions + TriviaQA labelling
+            + g(n_test) + f(2 * DIAG_N_PROMPTS) + 2 * g(n_test) + 4 * steered(n_test)
+            + (nC - 1) * g(n_test) + N_RANDOM_DRAWS * g(n_test) + n_plac * g(n_test)
+            + (1 + 2 * N_WQ_OWN_NULLS) * g(n_test) + f(8 * n_test)
+            + (n_seeds - 1) * (3 * steered(n_test) + 2 * g(n_test)))
     n_rand_abl = sum(N_RANDOM_ABLATION_DRAWS.values())
-    ablations = ((2 * (nC - 1) + 2 + 1 + 1 + N_LABEL_PERM_DRAWS + N_COV_MATCHED_DRAWS + 2 * len(REFUSAL_ABLATION_VARIANTS)
-                  + n_rand_abl) * g(n_test) + f(n_rand_abl * 128) + g(0.8 * n_test)
-                 + 3 * len(DOSE_C_GRID) * 2 * f(300))
-    eq = 5 * g(600) + N_RANDOM_DRAWS * g(EQ_SUBSET_N)
-    tqa = 4 * steered(1000) + g(TQA_SUBSET_N) + N_RANDOM_DRAWS * g(TQA_SUBSET_N)
-    side = f(200 * 11) + f(500 * 6) + i(1300)
+    ablations = ((N_LABEL_PERM_DRAWS + 2 * len(REFUSAL_ABLATION_VARIANTS) + n_rand_abl) * g(n_test)
+                 + f(n_rand_abl * 128) + g(0.8 * n_test) + 10 * 4 * 3 * f(300))
+    eq = 5 * g(600)
+    tqa = 5 * steered(1000)
+    side = f(200 * 12) + f(500 * 5) + i(4 * (N_ALPACA_BENIGN + N_ADV_HELDOUT) + N_INSTR_RANDOM_DRAWS * N_ALPACA_BENIGN)
     steps = {"pretest": pretest + 60, "pretest_seeds": (n_seeds - 1) * pretest_seed, "test": test,
              "ablations": ablations, "eq": eq, "tqa": tqa, "side_effects": side}
-    savings = {"eq_subset_150": ("eq", N_RANDOM_DRAWS * g(EQ_SUBSET_N - 150)),
-               "tqa_subset_150": ("tqa", N_RANDOM_DRAWS * g(TQA_SUBSET_N - 150)),
-               "random_ablation_reduced": ("ablations", (n_rand_abl - 4) * g(n_test)),
-               "drop_alt_layer": ("ablations", g(n_test)),
-               "label_perm_3": ("ablations", (N_LABEL_PERM_DRAWS - 3) * g(n_test)),
-               "cov_matched_3": ("ablations", (N_COV_MATCHED_DRAWS - 3) * g(n_test)),
-               "wq_answer_random_1": ("test", (N_WQ_ANSWER_RANDOM - 1) * g(n_test)),
-               "test_1200": ("test", 0.2 * (test + ablations))}
+    savings = {"instr_random_2": ("side_effects", max(0, N_INSTR_RANDOM_DRAWS - 2) * i(N_ALPACA_BENIGN)),
+               "random_ablation_reduced": ("ablations", max(0, n_rand_abl - 3) * g(n_test)),
+               "norm_random_5": ("test", max(0, N_RANDOM_DRAWS - 5) * g(n_test)),
+               "label_perm_3": ("ablations", max(0, N_LABEL_PERM_DRAWS - 3) * g(n_test)),
+               "wq_own_nulls_3": ("test", 2 * max(0, N_WQ_OWN_NULLS - 3) * g(n_test)),
+               "placebo_reduced": ("test", (max(0, N_PLACEBO_ISO - 4) + max(0, N_PLACEBO_COV - 2)) * g(n_test))}
     return steps, savings
 
 
@@ -159,11 +168,10 @@ class Budget:
         return full
 
     def check_emergency(self):
-        """Last resort beyond the ladder (as in the first run): if the projection exceeds the hard
-        run limit, the transfer-set random draws drop to MIN_RANDOM_DRAWS (never < 10)."""
+        """Logged only: the final run has no transfer-set random draws left to cut."""
         if self.emergency_eq_draws is None and self.project() > RUN_LIMIT_SECONDS:
-            self.emergency_eq_draws = MIN_RANDOM_DRAWS
-            self._log("emergency_transfer_draws")
+            self.emergency_eq_draws = 0
+            self._log("projection_exceeds_run_limit")
 
     def _log(self, at, proj=None):
         proj = self.project() if proj is None else proj
@@ -171,18 +179,13 @@ class Budget:
                              "projected_total_s": proj, "flags": list(self.flags)})
         print(f"BUDGET: at={at} scale={self.scale:.3f} projected_total_s={proj:.0f} ladder={self.flags}", flush=True)
 
-    eq_subset_n = property(lambda s: 150 if "eq_subset_150" in s.flags else EQ_SUBSET_N)
-    tqa_subset_n = property(lambda s: 150 if "tqa_subset_150" in s.flags else TQA_SUBSET_N)
-    run_alt_layer = property(lambda s: "drop_alt_layer" not in s.flags)
-    n_label_perm = property(lambda s: 3 if "label_perm_3" in s.flags else N_LABEL_PERM_DRAWS)
-    n_cov_matched = property(lambda s: 3 if "cov_matched_3" in s.flags else N_COV_MATCHED_DRAWS)
-    n_wq_answer_random = property(lambda s: 1 if "wq_answer_random_1" in s.flags else N_WQ_ANSWER_RANDOM)
-    test_per_decile = property(lambda s: 120 if "test_1200" in s.flags else 150)
-    n_eq_draws = property(lambda s: min(s.emergency_eq_draws or N_RANDOM_DRAWS, N_RANDOM_DRAWS))
+    def count(self, flag, full, reduced):
+        """Size of a ladder-guarded piece of work (decides the flag when first asked)."""
+        return full if self.allow(flag) else min(reduced, full)
 
     def n_random_ablation(self, variant):
         if "random_ablation_reduced" in self.flags:
-            return 2 if variant == "refusal_dir_ablation" else 1
+            return 1
         return N_RANDOM_ABLATION_DRAWS[variant]
 
 
@@ -344,8 +347,8 @@ class ModelRunner:
         self.fit_directions()
         self.dev_baselines_for_caps()
         self.dev_sweep()
-        self.dev_nulls()
-        self.dev_wq_answer_ladder()
+        self.dev_placebos()
+        self.dev_wq_own_ladder()
         self.budget.finish(self.name, "pretest")
         self.budget.start(self.name, "pretest_seeds")
         for s in range(1, N_SEEDS):
@@ -360,7 +363,7 @@ class ModelRunner:
         self.fit_directions()
         self.caps_base = parent.caps_base
         self.dev_sweep()
-        self.dev_nulls()
+        self.dev_placebos()
         self.timer.mark(f"seed{self.seed}_pretest[{self.name}]")
 
     def label_side(self, splits):
@@ -453,11 +456,21 @@ class ModelRunner:
         self.extras["known_unknown_masks"] = (known, unknown)
         self.dirs["knowledge"] = k.fit_direction(self.cand, known=known, unknown=unknown)
         self.dirs["read"] = ReadDirectionSteer(self).fit_direction(self.cand)
+        # final F4: uniform abstention push (every seed: it depends on the seed's train draw)
+        self.dirs["force"] = ForcedAbstentionDirection(self).fit(self.cand)
         R = self.cache["train"]["resid_last"]
         self.rbar = mean_norms(R)
         self.sigma = {key: {L: projection_sd(R[:, L], self.dirs[key][L]) for L in self.cand}
-                      for key in ("knowledge", "read", "refusal")}
+                      for key in ("knowledge", "read", "refusal", "force")}
         if self.seed == 0:
+            # final F5: D_ku = within-relation part + between-relation (question-type) part
+            rel = np.array([it.prop for it in self.items["train"]], dtype=object)
+            self.dirs["ku_within_rel"], self.dirs["ku_between_rel"], dec = k.fit_decomposition(
+                self.cand, known, unknown, rel)
+            self.extras["ku_decomposition"] = dec
+            for L, x in dec.items():
+                print(f"KU_DECOMPOSITION model={self.name} L={L} between_energy_share={x['between_energy_share']:.3f} "
+                      f"cos_full_within={x['cos_full_within']:.3f} cos_full_between={x['cos_full_between']:.3f}", flush=True)
             cols = {L: j for j, L in enumerate(self.cand)}
             H, q, lab = self.gray["H"], self.gray["qidx"], self.gray["labels"]
             self.dirs["wq"] = WithinQuestionDirectionSteer.fit_direction(H, q, lab, cols)
@@ -478,7 +491,9 @@ class ModelRunner:
                     diff = (self.cache["train"]["idk_resid"][:, self.cache_layers.index(L)]
                             - self.ans_res["train"]["last"][:, cols[L]])
                     self.dirs["idk_caa"][L] = unit(diff[wrong].mean(0))
-            self.random_dirs = random_unit_directions(self.spec["d_model"], N_RANDOM_DRAWS, RANDOM_SEED_BASE)
+            # >= 5 draws always exist (side effects use draws 0-4, perplexity 0-1, integrity 0)
+            self.random_dirs = random_unit_directions(self.spec["d_model"], max(N_RANDOM_DRAWS, N_INSTR_RANDOM_DRAWS,
+                                                                                N_PPL_RANDOM_DRAWS, 1), RANDOM_SEED_BASE)
         self.direction_diagnostics()
         self.timer.mark(f"direction_fitting[{self.name}][seed{self.seed}]")
 
@@ -515,10 +530,12 @@ class ModelRunner:
                               for L in self.ref_cand}
         variants = {"refusal_dir_ablation": {"L_ref": L_ref, "per_layer": per_layer, "passed": passed, "mode": "directional",
                                              "layers": "all"}}
+        # final F7: every variant uses the registered arm's L_ref (run 2 let each variant pick its own layer,
+        # so the three variants differed in layer as well as in method: Llama 14/14/17, Qwen 18/22/14)
         for vname, spec in REFUSAL_ABLATION_VARIANTS.items():
             if vname in variants:
                 continue
-            Lv, plv, pv = r.positive_control(self.ref_cand, harm_rate, spec["mode"], spec["layers"], self.refusal_means)
+            Lv, plv, pv = r.positive_control([L_ref], harm_rate, spec["mode"], spec["layers"], self.refusal_means)
             variants[vname] = {"L_ref": Lv, "per_layer": plv, "passed": pv, **spec}
         self.frozen["refusal_ablation"] = {k: {kk: vv for kk, vv in v.items() if kk != "per_layer"} for k, v in variants.items()}
         self.side["refusal_control"] = {"unsteered_harmful_refusal": harm_rate, "unsteered_benign_refusal": ben_rate,
@@ -624,7 +641,6 @@ class ModelRunner:
                       f"calls_decode={v['hook_calls'].get('decode', 0)} frac_changed={v['frac_changed']:.3f} "
                       f"kl_first_token={v['kl_first_token']:.5f} abst_increase={v['abst_increase']:.2f} "
                       f"no_op={v['no_op']}", flush=True)
-            self._descriptive_sweeps(base)
 
         # thresholds (tau_dev(lambda)); seeds >= 1 refit only what the seeded arms use
         self.frozen["tau"] = {}
@@ -639,31 +655,37 @@ class ModelRunner:
             self.frozen["tau"]["tqa_margin"] = {lam: fit_threshold(self.uout["tqa_dev"].states, self.margin["tqa_dev"], lam)
                                                 for lam in LAMBDAS}
             self._sample_vote_thresholds()
-            self._dev_cov_matched(sweep)
-            self.frozen["L_alt"] = sorted(self.cand, key=lambda L: (-abs(L - L_star), L))[0]
+        self.frozen["clean_doses"] = [c for c in C_GRID
+                                      if sweep[(L_star, c)]["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE]
+        self._tune_gated_strength()
         self.timer.mark(f"dev_tuning[{self.name}][seed{self.seed}]")
 
-    def _descriptive_sweeps(self, base):
-        """Descriptive only (registered): D_wq and refusal at the shared positions, with the same
-        absolute norms as the knowledge sweep (c * sigma_L(D_ku))."""
-        wq = WithinQuestionDirectionSteer(self)
-        wq_sweep = {}
-        for L in self.cand:
-            for c in C_GRID:
-                iv = wq.intervention(L, c, direction=self.dirs["wq"][L], alpha=c * self.sigma["knowledge"][L])
-                o = self.run_steered(iv, "dev", f"wq_l{L}_c{c:g}", check_zero=False)
-                self.dev_outputs[f"wq_l{L}_c{c:g}"] = o
-                wq_sweep[f"l{L}_c{c:g}"] = self._sweep_entry(o, base, iv, kl=(c == C_GRID[-1]))
-        self.dev["wq_sweep_descriptive"] = wq_sweep
-        rf = RefusalDirectionSteer(self)
+    def _tune_gated_strength(self):
+        """Final F2 (H1c re-specified). Registered H1c ran gated steering at c*, chosen for ungated
+        steering under an abstention-increase cap; with the gate covering ~90% of items the outcome was
+        fixed by that dose (gated ~ ungated steering). Gated steering now gets its own strength: the
+        clean dose of the knowledge dev ladder at L* that maximises dev S1 of gated steering (gate =
+        dev unsteered abstained or dev margin < tau_dev(1)); ties within 0.5 points -> smaller c."""
         L = self.frozen["L_star"]
-        ref_sweep = {}
+        base = self.uout["dev"]
+        gate = MarginGatedSteer.compute_gate(base.states, self.margin["dev"], self.frozen["tau"]["margin"][LAMBDA_PRIMARY])
+        res = {}
         for c in C_GRID:
-            iv = rf.intervention(L, c, alpha=self.site_alpha(c))
-            o = self.run_steered(iv, "dev", f"refusal_c{c:g}", check_zero=False)
-            self.dev_outputs[f"refusal_c{c:g}"] = o
-            ref_sweep[f"c{c:g}"] = self._sweep_entry(o, base, iv, kl=False)
-        self.dev["refusal_sweep_descriptive"] = ref_sweep
+            o = self.dev_outputs.get(f"knowledge_l{L}_c{c:g}")
+            if o is None:
+                continue
+            res[c] = {"S1_gated": abstention_score(np.where(gate, o.states, base.states)),
+                      "degenerate_rate": float(o.degenerate.mean()), "n_gated": int(gate.sum())}
+        clean = {c: v for c, v in res.items() if v["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE}
+        if clean:
+            best = max(v["S1_gated"] for v in clean.values())
+            c_gate = min(c for c, v in clean.items() if v["S1_gated"] >= best - DEV_TIE_POINTS)
+        else:
+            c_gate = self.frozen["c_star"]
+        self.frozen["c_gate"] = float(c_gate)
+        self.frozen["gated_tuning"] = {f"c{c:g}": v for c, v in res.items()}
+        print(f"DEV_SELECTION_GATED model={self.name} seed={self.seed} c_gate={c_gate:g} "
+              f"c_star={self.frozen['c_star']:g} S1_gated={res.get(c_gate, {}).get('S1_gated', float('nan')):.2f}", flush=True)
 
     def _dev_subset_base(self):
         sub = self.dev_subset
@@ -672,121 +694,153 @@ class ModelRunner:
         self.dev_outputs["unsteered_dev_subset"] = o
         return o
 
-    def _knowledge_target(self, sub_base):
+    def _knowledge_target_items(self, sub_base):
+        """knowledge_dir_steer's dev-subset abstention increase, in items."""
         sub = self.dev_subset
-        return 100 * (_abst(self._knowledge_dev_out.states[sub]) - _abst(sub_base.states))
+        return int((self._knowledge_dev_out.states[sub] == A_).sum()) - int((sub_base.states == A_).sum())
 
-    def _dev_cov_matched(self, sweep):
-        """Registered isotropic coverage-matched draws (multipliers {1, 2, 4} x alpha*)."""
-        sub_base = self._dev_subset_base()
-        self._sub_base = sub_base
-        target = self._knowledge_target(sub_base)
-        rnd = RandomDirectionPlacebo(self, N_COV_MATCHED_DRAWS)
-        cov = {}
-        for kdraw in range(N_COV_MATCHED_DRAWS):
-            res = {}
-            for m in COV_MATCH_MULTIPLIERS:
-                o = self.run_steered(rnd.intervention(kdraw, m), "dev", f"rnd{kdraw}_x{m}", idx=self.dev_subset,
+    def _sign_by_margin_proxy(self, L, v, alpha):
+        """Final F3: a random placebo takes the sign whose addition lowers the mean teacher-forced
+        margin log P(own greedy answer) - log P(IDK) more on the first DIAG_N_PROMPTS answered dev
+        questions (the sign that pushes toward abstention). Uses dev only."""
+        dev = self.uout["dev"]
+        idx = [i for i in range(len(dev)) if dev.states[i] != A_ and len(self.ugen["dev"].token_ids[i]) > 0][:DIAG_N_PROMPTS]
+        if not idx:
+            return 1.0, None
+        P = [self.prompts["dev"][i] for i in idx]
+        conts = [list(self.ugen["dev"].token_ids[i]) + [self.fmt.eot_id] for i in idx]
+        sq = SteeredQA(self)
+        mean = {}
+        for s in (1.0, -1.0):
+            iv = steer("sign_proxy", L, s * v, alpha)
+            mean[s] = float(np.mean(sq.teacher_forced_logprob(iv, P, conts) - sq.idk_logprob(iv, P)))
+        return (1.0 if mean[1.0] <= mean[-1.0] else -1.0), {"mean_margin_plus": mean[1.0], "mean_margin_minus": mean[-1.0]}
+
+    def _match_dose(self, L, v, sub_base, target, tag):
+        """Final F3: ascending multiples of alpha* on the dev subset until the abstention increase reaches
+        `target` items or the output degenerates (> 10%); then the geometric midpoint of the bracket. If
+        the smallest multiple already overshoots, smaller multiples are tried. The clean multiple whose
+        increase is closest to the target is frozen; matched = within +/- DOSE_MATCH_TOL_FRAC of the
+        subset, compared as integer item counts."""
+        a = self.frozen["alpha"]
+        base_ab = int((sub_base.states == A_).sum())
+        tol = int(round(DOSE_MATCH_TOL_FRAC * len(self.dev_subset)))
+        tried = {}
+
+        def run(m):
+            m = float(m)
+            if m not in tried:
+                o = self.run_steered(steer(f"{tag}_x{m:g}", L, v, m * a), "dev", f"{tag}_x{m:g}", idx=self.dev_subset,
                                      check_zero=False)
-                self.dev_outputs[f"cov_matched_s{kdraw}_x{m}"] = o
-                res[m] = {"abst_increase": 100 * (_abst(o.states) - _abst(sub_base.states)),
-                          "degenerate_rate": float(o.degenerate.mean())}
-            # clean = degenerate <= 10%; a draw is matched if some clean multiplier reaches the target
-            # dose (closest clean multiplier frozen); otherwise the largest clean multiplier, unmatched.
-            ok = {m: v for m, v in res.items() if v["degenerate_rate"] <= COV_MATCH_MAX_DEGENERATE}
-            reached = [m for m, v in ok.items() if v["abst_increase"] >= target]
-            if reached:
-                m_sel, matched = min(ok, key=lambda m: (abs(ok[m]["abst_increase"] - target), m)), True
-            elif ok:
-                m_sel, matched = max(ok), False
-            else:
-                m_sel, matched = min(COV_MATCH_MULTIPLIERS), False
-            cov[kdraw] = {"multiplier": m_sel, "matched": matched, "per_multiplier": res}
-        self.frozen["cov_matched"] = {"target_abst_increase": target, "draws": cov}
+                self.dev_outputs[f"{tag}_x{m:g}"] = o
+                tried[m] = {"abst_increase_items": int((o.states == A_).sum()) - base_ab,
+                            "degenerate_rate": float(o.degenerate.mean()), "S1": abstention_score(o.states)}
+            return tried[m]
 
-    def dev_nulls(self):
-        """Amendment A9: dose-matched nulls, multiplier of alpha* matched to knowledge_dir_steer's dev
-        abstention increase on the dev subset (clean = degenerate <= 10%; matched = within +/- 3 points)."""
+        clean = lambda r: r["degenerate_rate"] <= COV_MATCH_MAX_DEGENERATE
+        prev, bracket = None, None
+        for m in PLACEBO_MULTIPLIERS:
+            r = run(m)
+            if not clean(r):
+                break
+            if r["abst_increase_items"] >= target:
+                bracket = (prev, m)
+                break
+            prev = m
+        if bracket is not None and bracket[0] is None:          # overshoot at the smallest multiple
+            hi, bracket = bracket[1], None
+            for m in PLACEBO_LOW_MULTIPLIERS:
+                r = run(m)
+                if clean(r) and r["abst_increase_items"] < target:
+                    bracket = (m, hi)
+                    break
+                hi = m
+        if bracket is not None and bracket[0] is not None:
+            run(float(np.sqrt(bracket[0] * bracket[1])))
+        ok = {m: r for m, r in tried.items() if clean(r)}
+        if ok:
+            m_sel = min(ok, key=lambda m: (abs(ok[m]["abst_increase_items"] - target), m))
+            matched = abs(ok[m_sel]["abst_increase_items"] - target) <= tol
+        else:
+            m_sel, matched = min(tried), False
+        return {"multiplier": m_sel, "matched": bool(matched), "achieved_items": tried[m_sel]["abst_increase_items"],
+                "target_items": int(target), "tol_items": tol, "max_clean_increase_items":
+                    max((r["abst_increase_items"] for r in ok.values()), default=None),
+                "per_multiplier": {f"{m:g}": r for m, r in sorted(tried.items())}}
+
+    def dev_placebos(self):
+        """Final F3-F5: dose-matched comparison arms for H1b, each frozen at the multiple of alpha* whose
+        dev-subset abstention increase matches knowledge_dir_steer's:
+          force                 uniform abstention push D_force (every seed);
+          ku_within_relation    D_ku with the between-relation (question-type) component removed (seed 0);
+          ku_between_relation   the between-relation component alone (seed 0);
+          iso_s<k>, cov_s<k>    sign-aligned isotropic / covariance-shaped random directions (seed 0)."""
         if self._sub_base is None:
             self._sub_base = self._dev_subset_base()
         sub_base = self._sub_base
-        target = self._knowledge_target(sub_base)
+        target = self._knowledge_target_items(sub_base)
         L, a = self.frozen["L_star"], self.frozen["alpha"]
-        self.dirs["nulls"] = DoseMatchedNull.directions(self, self.seed)
-        info = {"target_abst_increase": target}
-        for t in NULL_TYPES:
-            v = self.dirs["nulls"][t]
-            res = {}
-            for m in NULL_MULTIPLIERS:
-                o = self.run_steered(steer(f"null_{t}_x{m:g}", L, v, m * a), "dev", f"null_{t}_x{m:g}",
-                                     idx=self.dev_subset, check_zero=False)
-                self.dev_outputs[f"null_{t}_x{m:g}"] = o
-                res[m] = {"abst_increase": 100 * (_abst(o.states) - _abst(sub_base.states)),
-                          "degenerate_rate": float(o.degenerate.mean()), "S1": abstention_score(o.states)}
-            ok = {m: r for m, r in res.items() if r["degenerate_rate"] <= COV_MATCH_MAX_DEGENERATE}
-            if ok:
-                m_sel = min(ok, key=lambda m: (abs(ok[m]["abst_increase"] - target), m))
-                matched = abs(ok[m_sel]["abst_increase"] - target) <= DOSE_MATCH_TOL
-            else:
-                m_sel, matched = min(NULL_MULTIPLIERS), False
-            info[t] = {"multiplier": m_sel, "matched": matched, "per_multiplier": res,
-                       "cos_with_knowledge": cosine(v, self.dirs["knowledge"][L])}
-            print(f"DOSE_MATCHED_NULL model={self.name} seed={self.seed} null={t} multiplier={m_sel:g} matched={matched} "
-                  f"target={target:.2f} achieved={res[m_sel]['abst_increase']:.2f}", flush=True)
-        self.frozen["nulls"] = info
+        cands = {"force": (self.dirs["force"][L], False)}
+        if self.seed == 0:
+            cands["ku_within_relation"] = (self.dirs["ku_within_rel"][L], False)
+            cands["ku_between_relation"] = (self.dirs["ku_between_rel"][L], False)
+            for k, v in enumerate(random_unit_directions(self.spec["d_model"], N_PLACEBO_ISO, PLACEBO_SEED_BASE)):
+                cands[f"iso_s{k}"] = (v, True)
+            R = self.cache["train"]["resid_last"][:, L]
+            for k in range(N_PLACEBO_COV):
+                cands[f"cov_s{k}"] = (covariance_shaped_direction(R, PLACEBO_SEED_BASE + 100 + k), True)
+        self.dirs["placebos"] = {}
+        info = {"target_abst_increase_items": target, "n_subset": len(self.dev_subset), "placebos": {}}
+        for p, (v, align) in cands.items():
+            sign, proxy = self._sign_by_margin_proxy(L, v, SIGN_PROXY_MULTIPLIER * a) if align else (1.0, None)
+            vv = sign * v
+            res = self._match_dose(L, vv, sub_base, target, f"placebo_{p}")
+            self.dirs["placebos"][p] = vv
+            info["placebos"][p] = {"sign": sign, "sign_proxy": proxy, "cos_with_knowledge": cosine(vv, self.dirs["knowledge"][L]),
+                                   **res}
+            print(f"DOSE_MATCHED_PLACEBO model={self.name} seed={self.seed} placebo={p} sign={sign:+.0f} "
+                  f"multiplier={res['multiplier']:g} matched={res['matched']} target_items={target} "
+                  f"achieved_items={res['achieved_items']} max_clean_increase_items={res['max_clean_increase_items']}",
+                  flush=True)
+        self.frozen["placebos"] = info
 
-    def dev_wq_answer_ladder(self):
-        """Amendment A9: D_wq at answer positions, own layer x strength ladder (c * sigma^ans_L(D_wq));
-        highest dev S1 with degenerate <= 5% and the caps, ties -> smaller c then middle layer; plus a
-        norm-matched random ladder at the selected layer (descriptive, dev subset)."""
+    def dev_wq_own_ladder(self):
+        """Final F10: D_wq at its own scale. At the shared site D_wq was added with D_ku's absolute norm,
+        about 18 (Llama) / 58 (Qwen) sigma of D_wq's own spread, so its null W->C could be an overdose.
+        Ladder c * sigma_{L*}(D_wq), c in WQ_OWN_C_GRID, at L* and the shared positions; selection =
+        largest net (W->C minus C->W) on dev among doses with degenerate <= 5% that pass the A11 caps
+        (checked in that order), ties -> smaller c."""
+        L = self.frozen["L_star"]
         base = self.uout["dev"].states
-        wq = WithinQuestionDirectionSteer(self)
+        s = self.sigma["wq"][L]
         sweep = {}
-        for L in self.cand:
-            for c in WQ_ANSWER_C_GRID:
-                a = c * self.sigma["wq_answer"][L]
-                iv = wq.answer_position_intervention(L, a, self.dirs["wq"][L], f"wq_answer_l{L}_c{c:g}")
-                o = self.run_steered(iv, "dev", f"wq_answer_l{L}_c{c:g}", check_zero=False)
-                self.dev_outputs[f"wq_answer_l{L}_c{c:g}"] = o
-                sweep[(L, c)] = self._sweep_entry(o, base, iv, kl=False)
-        middle = self.cand[len(self.cand) // 2]
-        clean = [k for k, v in sweep.items() if v["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE]
-        elig = []
-        for k in sorted(clean, key=lambda k: -sweep[k]["S1"]):
-            if elig and sweep[k]["S1"] < sweep[elig[0]]["S1"] - DEV_TIE_POINTS:
-                break                       # below the tie window of the best eligible configuration
-            cp = sweep[k]["caps"] = self.caps(k[0], self.dirs["wq"][k[0]], sweep[k]["alpha"])
+        for c in WQ_OWN_C_GRID:
+            iv = steer(f"wq_own_c{c:g}", L, self.dirs["wq"][L], c * s)
+            o = self.run_steered(iv, "dev", f"wq_own_c{c:g}", check_zero=False)
+            self.dev_outputs[f"wq_own_c{c:g}"] = o
+            e = self._sweep_entry(o, base, iv, kl=False)
+            e["C_to_W"] = int(((base == C_) & (o.states == W_)).sum())
+            e["net_W_to_C"] = e["W_to_C"] - e["C_to_W"]
+            sweep[c] = e
+        order = sorted([c for c, e in sweep.items() if e["degenerate_rate"] <= DEV_ELIGIBLE_MAX_DEGENERATE],
+                       key=lambda c: (-sweep[c]["net_W_to_C"], c))
+        sel, rule = None, "no clean dose"
+        for c in order:
+            cp = sweep[c]["caps"] = self.caps(L, self.dirs["wq"][L], c * s)
             cp["passed"] = bool(cp["mmlu_delta"] >= MMLU_CAP_POINTS and cp["ppl_ratio"] <= PPL_CAP_RATIO)
             if cp["passed"]:
-                elig.append(k)
-        if elig:
-            best = max(sweep[k]["S1"] for k in elig)
-            L, c = sorted([k for k in elig if sweep[k]["S1"] >= best - DEV_TIE_POINTS],
-                          key=lambda k: (k[1], k[0] != middle))[0]
-            rule = "eligible"
-        else:
-            L, c, rule = middle, WQ_ANSWER_C_GRID[0], "no clean operating point"
-        alpha = c * self.sigma["wq_answer"][L]
-        self.frozen["wq_answer"] = {"L": L, "c": c, "alpha": alpha, "rule": rule, "positions": "generated_only",
-                                    "strength_unit": "sigma^answer_L(D_wq)"}
-        self.dev["wq_answer_sweep"] = {f"l{k[0]}_c{k[1]:g}": v for k, v in sweep.items()}
-        print(f"DEV_SELECTION_WQ_ANSWER model={self.name} L={L} c={c:g} alpha={alpha:.3f} rule={rule}", flush=True)
-        if self._sub_base is None:
-            self._sub_base = self._dev_subset_base()
-        sub_base = self._sub_base
-        dirs = random_unit_directions(self.spec["d_model"], N_WQ_ANSWER_RANDOM, WQ_ANSWER_RANDOM_SEED_BASE)
-        rl = {}
-        for cc in WQ_ANSWER_C_GRID:
-            a = cc * self.sigma["wq_answer"][L]
-            for j, v in enumerate(dirs):
-                o = self.run_steered(steer(f"wq_ans_rand{j}", L, v, a, "generated_only"), "dev",
-                                     f"wq_answer_random_s{j}_c{cc:g}", idx=self.dev_subset, check_zero=False)
-                self.dev_outputs[f"wq_answer_random_s{j}_c{cc:g}"] = o
-                rl[f"s{j}_c{cc:g}"] = {"S1": abstention_score(o.states),
-                                       "W_to_C": int(((sub_base.states == W_) & (o.states == C_)).sum()),
-                                       "degenerate_rate": float(o.degenerate.mean())}
-        self.dev["wq_answer_random_ladder"] = rl
-        self.timer.mark(f"dev_wq_answer_ladder[{self.name}]")
+                sel, rule = c, "eligible"
+                break
+        if sel is None:
+            sel = order[0] if order else WQ_OWN_C_GRID[0]
+            rule = "no clean dose passes the caps" if order else rule
+        self.frozen["wq_own"] = {"L": L, "c": float(sel), "alpha": float(sel * s), "sigma_wq": float(s),
+                                 "alpha_over_shared_alpha": float(sel * s / self.frozen["alpha"]), "rule": rule,
+                                 "positions": "both", "strength_unit": "sigma_L*(D_wq)"}
+        self.dev["wq_own_sweep"] = {f"c{c:g}": v for c, v in sweep.items()}
+        print(f"DEV_SELECTION_WQ_OWN model={self.name} L={L} c={sel:g} alpha={sel * s:.3f} sigma_wq={s:.4f} "
+              f"shared_alpha={self.frozen['alpha']:.3f} rule={rule} dev_net_W_to_C={sweep[sel]['net_W_to_C']}", flush=True)
+        self.timer.mark(f"dev_wq_own_ladder[{self.name}]")
 
     def _sample_vote_thresholds(self):
         """Amendment A9: tau_dev(lambda) for the majority-vote and best-of-k gates (dev samples)."""
@@ -800,15 +854,19 @@ class ModelRunner:
     def frozen_entry(self):
         L = self.frozen["L_star"]
         entry = dict(self.frozen)
-        entry["directions_at_L_star"] = {k: self.dirs[k][L].tolist() for k in ("knowledge", "read", "wq", "refusal")}
-        entry["direction_wq_answer"] = self.dirs["wq"][self.frozen["wq_answer"]["L"]].tolist()
+        entry["directions_at_L_star"] = {k: self.dirs[k][L].tolist() for k in ("knowledge", "read", "wq", "refusal",
+                                                                              "force", "ku_within_rel", "ku_between_rel")}
+        entry["placebo_directions_signed"] = {p: v.tolist() for p, v in self.dirs.get("placebos", {}).items()}
+        entry["ku_decomposition"] = self.extras.get("ku_decomposition")
         entry.update({"model": self.name, "hf_id": self.spec["hf_id"], "revision": self.revision,
                       "tau_store": self.tau_store, "budget_flags": list(self.budget.flags),
                       "dev_selection_caps": {"mmlu_delta_min": MMLU_CAP_POINTS, "ppl_ratio_max": PPL_CAP_RATIO}})
         entry["seeds"] = {}
         for s, f in self.seed_runs.items():
             e = dict(f.frozen)
-            e["directions_at_L_star"] = {k: f.dirs[k][f.frozen["L_star"]].tolist() for k in ("knowledge", "read", "refusal")}
+            e["directions_at_L_star"] = {k: f.dirs[k][f.frozen["L_star"]].tolist()
+                                         for k in ("knowledge", "read", "refusal", "force")}
+            e["placebo_directions_signed"] = {p: v.tolist() for p, v in f.dirs.get("placebos", {}).items()}
             entry["seeds"][str(s)] = e
         blob = json.dumps(entry, sort_keys=True, default=str)
         entry["sha256"] = hashlib.sha256(blob.encode()).hexdigest()
@@ -932,22 +990,22 @@ class ModelRunner:
                 steer(f"wq_r{r}", L, self.dirs["wq_refits"][r][L], a), "test", f"within_question_dir_steer_r{r}")
         return out
 
-    def cond_wq_answer_positions(self):
-        f = self.frozen["wq_answer"]
-        wq = WithinQuestionDirectionSteer(self)
-        out = {}
-        for r in range(N_WQ_REFITS):
-            name = "within_question_dir_steer_answer_positions" + ("" if r == 0 else f"_r{r}")
-            iv = wq.answer_position_intervention(f["L"], f["alpha"], self.dirs["wq_refits"][r][f["L"]], name)
-            out[name] = self.run_steered(iv, "test", name)
-        dirs = random_unit_directions(self.spec["d_model"], N_WQ_ANSWER_RANDOM, WQ_ANSWER_RANDOM_SEED_BASE)
-        for j in range(N_WQ_ANSWER_RANDOM if self.budget.allow("wq_answer_random_1") else 1):
-            name = f"wq_answer_random_s{j}"
-            out[name] = self.run_steered(steer(name, f["L"], dirs[j], f["alpha"], "generated_only"), "test", name)
-        return out
-
     def cond_refusal_dir_steer(self):
         return self._primary_steer(RefusalDirectionSteer, "refusal_dir_steer")
+
+    def cond_knowledge_dose_ladder(self):
+        """Registered knowledge dose ladder (the other grid values at L*), moved before the gated arm:
+        final F2 composes tuned gated steering from it and final H1a reports the surplus at every dose."""
+        k = KnowledgeDirectionSteer(self)
+        return {f"knowledge_dir_steer_c{c:g}": self.run_steered(k.intervention(c=c), "test", f"knowledge_dir_steer_c{c:g}")
+                for c in C_GRID if c != self.frozen["c_star"]}
+
+    def _knowledge_at(self, c, outs):
+        name = "knowledge_dir_steer" if c == self.frozen["c_star"] else f"knowledge_dir_steer_c{c:g}"
+        if name in outs:
+            return outs[name], name
+        o = self.run_steered(KnowledgeDirectionSteer(self).intervention(c=c), "test", f"knowledge_dir_steer_c{c:g}")
+        return o, f"knowledge_dir_steer_c{c:g}"
 
     def cond_margin_gated_steer(self):
         base = self.uout["test"]
@@ -958,27 +1016,57 @@ class ModelRunner:
             if src not in self.test_out:
                 raise RuntimeError(f"{src} test output missing; cannot compose {inst}")
             out[inst] = MarginGatedSteer.compose_outputs(inst, base, self.test_out[src], gate)
+        src, src_name = self._knowledge_at(self.frozen["c_gate"], self.test_out)
+        out["margin_gated_steer_knowledge_tuned"] = MarginGatedSteer.compose_outputs(
+            "margin_gated_steer_knowledge_tuned", base, src, gate)
+        out["margin_gated_steer_knowledge_tuned"].extra.update({"c_gate": self.frozen["c_gate"], "source": src_name})
         return out
 
-    def cond_dose_matched_null(self):
+    def cond_dose_matched_placebo(self):
+        """Final F3-F5: the dose-matched arms frozen on dev (uniform push, D_ku decomposition, random)."""
         L, a = self.frozen["L_star"], self.frozen["alpha"]
+        info = self.frozen["placebos"]["placebos"]
+        n_iso = self.budget.count("placebo_reduced", N_PLACEBO_ISO, 4)
+        n_cov = N_PLACEBO_COV if "placebo_reduced" not in self.budget.flags else min(2, N_PLACEBO_COV)
+        names = ["force", "ku_within_relation", "ku_between_relation"] + [f"iso_s{k}" for k in range(n_iso)] + \
+            [f"cov_s{k}" for k in range(n_cov)]
         out = {}
-        for t in NULL_TYPES:
-            info = self.frozen["nulls"][t]
-            name = f"dose_matched_null_{t}"
-            o = self.run_steered(steer(name, L, self.dirs["nulls"][t], info["multiplier"] * a), "test", name)
-            o.extra.update({"multiplier": info["multiplier"], "matched_on_dev": info["matched"]})
-            out[name] = o
+        for p in names:
+            if p not in info:
+                continue
+            cname = placebo_condition_name(p)
+            o = self.run_steered(steer(cname, L, self.dirs["placebos"][p], info[p]["multiplier"] * a), "test", cname)
+            o.extra.update({"multiplier": info[p]["multiplier"], "matched_on_dev": info[p]["matched"],
+                            "sign": info[p]["sign"], "placebo": p})
+            out[cname] = o
+        return out
+
+    def cond_wq_own(self):
+        """Final F10: D_wq at its dev-selected own-scale dose, with label-permuted D_wq and isotropic random
+        directions at the same norm and positions as its H4b nulls."""
+        f = self.frozen["wq_own"]
+        L, a = f["L"], f["alpha"]
+        n = min(self.budget.count("wq_own_nulls_3", N_WQ_OWN_NULLS, 3), len(self.dirs["wq_perm"]))
+        out = {"within_question_dir_steer_own": self.run_steered(
+            steer("within_question_dir_steer_own", L, self.dirs["wq"][L], a), "test", "within_question_dir_steer_own")}
+        for j in range(n):
+            name = f"label_permuted_wq_own_s{j}"
+            out[name] = self.run_steered(steer(name, L, self.dirs["wq_perm"][j][L], a), "test", name)
+        for j, v in enumerate(random_unit_directions(self.spec["d_model"], n, WQ_OWN_RANDOM_SEED_BASE)):
+            name = f"wq_own_random_s{j}"
+            out[name] = self.run_steered(steer(name, L, v, a), "test", name)
         return out
 
     def cond_random_dir_placebo(self):
-        rnd = RandomDirectionPlacebo(self, N_RANDOM_DRAWS)
+        n = self.budget.count("norm_random_5", N_RANDOM_DRAWS, 5)
+        rnd = RandomDirectionPlacebo(self, n)
         return {f"random_dir_placebo_s{k}": self.run_steered(rnd.intervention(k), "test", f"random_dir_placebo_s{k}")
-                for k in range(N_RANDOM_DRAWS)}
+                for k in range(n)}
 
     # ------------------------------------------------------------------ seed arms (amendment A8)
     def test_seed_arms(self, parent):
-        """Seed s >= 1: the H1a-critical arms at this seed's own frozen site."""
+        """Seed s >= 1: the H1-critical arms at this seed's own frozen site (final F3/F5: plus tuned gated
+        steering and the dose-matched uniform push)."""
         self.sync_shared(parent)
         base = self.uout["test"]
         out = {"unsteered": base}
@@ -989,7 +1077,18 @@ class ModelRunner:
         gate = MarginGatedSteer.compute_gate(base.states, self.margin["test"], self.frozen["tau"]["margin"][LAMBDA_PRIMARY])
         out["margin_gated_steer_knowledge"] = MarginGatedSteer.compose_outputs(
             "margin_gated_steer_knowledge", base, out["knowledge_dir_steer"], gate)
-        out.update(self.cond_dose_matched_null())
+        src, src_name = self._knowledge_at(self.frozen["c_gate"], out)
+        if src_name not in out:
+            out[src_name] = src
+        out["margin_gated_steer_knowledge_tuned"] = MarginGatedSteer.compose_outputs(
+            "margin_gated_steer_knowledge_tuned", base, src, gate)
+        out["margin_gated_steer_knowledge_tuned"].extra.update({"c_gate": self.frozen["c_gate"], "source": src_name})
+        L, a = self.frozen["L_star"], self.frozen["alpha"]
+        p = self.frozen["placebos"]["placebos"]["force"]
+        o = self.run_steered(steer("dose_matched_placebo_force", L, self.dirs["placebos"]["force"], p["multiplier"] * a),
+                             "test", "dose_matched_placebo_force")
+        o.extra.update({"multiplier": p["multiplier"], "matched_on_dev": p["matched"], "sign": 1.0, "placebo": "force"})
+        out["dose_matched_placebo_force"] = o
         for name, o in out.items():
             if name != "unsteered":
                 print(f"PROGRESS: model={self.name} seed={self.seed} condition={name} S1={abstention_score(o.states):.2f} "
@@ -997,53 +1096,12 @@ class ModelRunner:
         return out
 
     # ------------------------------------------------------------------ phase C: ablations
-    def abl_knowledge_dose_ladder(self):
-        k = KnowledgeDirectionSteer(self)
-        return {f"knowledge_dir_steer_c{c:g}": self.run_steered(k.intervention(c=c), "test", f"knowledge_dir_steer_c{c:g}")
-                for c in C_GRID if c != self.frozen["c_star"]}
-
-    def abl_within_question_dose_ladder(self):
-        w = WithinQuestionDirectionSteer(self)
-        return {f"within_question_dir_steer_c{c:g}": self.run_steered(w.intervention(c=c), "test", f"within_question_dir_steer_c{c:g}")
-                for c in C_GRID if c != self.frozen["c_star"]}
-
-    def abl_knowledge_last_prompt_only(self):
-        iv = KnowledgeDirectionSteer(self).intervention(positions="prompt_only")
-        return {"knowledge_dir_steer_last_prompt_only": self.run_steered(iv, "test", "knowledge_dir_steer_last_prompt_only")}
-
-    def abl_knowledge_generated_only(self):
-        iv = KnowledgeDirectionSteer(self).intervention(positions="generated_only")
-        return {"knowledge_dir_steer_generated_only": self.run_steered(iv, "test", "knowledge_dir_steer_generated_only")}
-
-    def abl_knowledge_alt_layer(self):
-        if not self.budget.allow("drop_alt_layer"):
-            print(f"BUDGET_SKIP: knowledge_dir_steer_alt_layer model={self.name} (degradation ladder)", flush=True)
-            return {}
-        iv = KnowledgeDirectionSteer(self).intervention(layer=self.frozen["L_alt"], c=self.frozen["c_star"])
-        return {"knowledge_dir_steer_alt_layer": self.run_steered(iv, "test", "knowledge_dir_steer_alt_layer")}
-
-    def abl_between_question_answer_dir(self):
-        L = self.frozen["L_star"]
-        iv = steer("bq", L, self.dirs["bq"][L], self.frozen["alpha"])
-        return {"between_question_answer_dir_steer": self.run_steered(iv, "test", "between_question_answer_dir_steer")}
-
     def abl_label_permuted_wq(self):
         L, a = self.frozen["L_star"], self.frozen["alpha"]
-        n = N_LABEL_PERM_DRAWS if self.budget.allow("label_perm_3") else min(3, N_LABEL_PERM_DRAWS)
+        n = self.budget.count("label_perm_3", N_LABEL_PERM_DRAWS, 3)
         return {f"label_permuted_wq_dir_steer_s{j}": self.run_steered(steer(f"wq_perm{j}", L, self.dirs["wq_perm"][j][L], a),
                                                                       "test", f"label_permuted_wq_dir_steer_s{j}")
                 for j in range(n)}
-
-    def abl_random_coverage_matched(self):
-        rnd = RandomDirectionPlacebo(self, N_COV_MATCHED_DRAWS)
-        n = N_COV_MATCHED_DRAWS if self.budget.allow("cov_matched_3") else min(3, N_COV_MATCHED_DRAWS)
-        out = {}
-        for k in range(n):
-            info = self.frozen["cov_matched"]["draws"][k]
-            o = self.run_steered(rnd.intervention(k, info["multiplier"]), "test", f"random_dir_placebo_coverage_matched_s{k}")
-            o.extra.update({"multiplier": info["multiplier"], "matched_on_dev": info["matched"]})
-            out[f"random_dir_placebo_coverage_matched_s{k}"] = o
-        return out
 
     def _ablation_iv(self, vname, r_hat=None, with_steer=False, means=None):
         v = self.frozen["refusal_ablation"][vname]
@@ -1102,6 +1160,11 @@ class ModelRunner:
         return {"first_token_ban_regenerate": o}
 
     def abl_teacher_forced_dose_response(self):
+        """H1e. Final F6: the grid stops at the largest dose that is clean on dev at (L*, c) (degenerate
+        <= 5%), with intermediate points for resolution; run 2 fitted slopes and monotonicity up to 64 sigma
+        where Llama's output was 100% degenerate. Comparison directions on the same grid: two
+        sign-aligned random placebos (same absolute norm as D_ku at every c) and the uniform push D_force
+        scaled by its dose-matched multiple (so c* means the dev-matched dose for every direction)."""
         self.guard("test")
         base = self.uout["test"]
         rng = np.random.default_rng(0)
@@ -1111,28 +1174,37 @@ class ModelRunner:
                     and len(self.ugen["test"].token_ids[i]) > 0]
             idx += [cand[j] for j in rng.permutation(len(cand))[:DOSE_ITEMS_PER_DECILE]]
         idx = sorted(idx)
+        clean = self.frozen.get("clean_doses") or [C_GRID[0]]
+        grid = [c for c in DOSE_C_GRID if c <= max(clean)]
         P = [self.prompts["test"][i] for i in idx]
         conts_a = [list(self.ugen["test"].token_ids[i]) + [self.fmt.eot_id] for i in idx]
         L = self.frozen["L_star"]
         sq = SteeredQA(self)
         none = Intervention("none")
         m0 = sq.teacher_forced_logprob(none, P, conts_a) - sq.idk_logprob(none, P)
-        dirs = {"knowledge_dir": self.dirs["knowledge"][L], "random_s0": self.random_dirs[0], "random_s1": self.random_dirs[1]}
-        res = {}
-        for dname, v in dirs.items():
+        pl, pinfo = self.dirs.get("placebos", {}), self.frozen.get("placebos", {}).get("placebos", {})
+        dirs = {"knowledge_dir": (self.dirs["knowledge"][L], 1.0)}
+        for k in range(2):
+            if f"iso_s{k}" in pl:
+                dirs[f"random_signaligned_s{k}"] = (pl[f"iso_s{k}"], 1.0)
+        if "force" in pl:
+            dirs["force"] = (pl["force"], float(pinfo["force"]["multiplier"]))
+        res = {"grid": grid, "clean_doses_dev": clean}
+        for dname, (v, scale) in dirs.items():
             M = [m0]
-            for c in DOSE_C_GRID[1:]:
-                iv = steer(f"dose_{dname}_{c}", L, v, self.site_alpha(c))   # same absolute norm for every direction
+            for c in grid[1:]:
+                iv = steer(f"dose_{dname}_{c:g}", L, v, scale * self.site_alpha(c))
                 M.append(sq.teacher_forced_logprob(iv, P, conts_a) - sq.idk_logprob(iv, P))
-            res[dname] = dose_statistics(np.stack(M, 1), np.array(DOSE_C_GRID))
+            res[dname] = dose_statistics(np.stack(M, 1), np.array(grid))
             res[dname]["margins"] = np.stack(M, 1)
+            res[dname]["strength_scale"] = scale
         agree = {}
         for c in C_GRID:
             name = "knowledge_dir_steer" if c == self.frozen["c_star"] else f"knowledge_dir_steer_c{c:g}"
             src = self.test_out.get(name, self.ablation_out.get(name))
-            if src is None or c not in DOSE_C_GRID:
+            if src is None or c not in grid:
                 continue
-            pred = res["knowledge_dir"]["margins"][:, DOSE_C_GRID.index(c)] < 0
+            pred = res["knowledge_dir"]["margins"][:, grid.index(c)] < 0
             actual = src.states[idx] == A_
             agree[f"c{c:g}"] = float((pred == actual).mean())
         res["generation_flip_agreement"] = agree
@@ -1159,16 +1231,23 @@ class ModelRunner:
                                                                         out["within_question_dir_steer"], gate)
         out["margin_gated_steer_knowledge"] = MarginGatedSteer.compose_outputs("margin_gated_steer_knowledge", base,
                                                                                out["knowledge_dir_steer"], gate)
-        self.budget.allow("eq_subset_150")
         self.budget.check_emergency()
-        sub = eq_subset_indices(items, self.budget.eq_subset_n)
-        sub_gen = mu.generate(self.model, self.fmt, [self.prompts["eq"][i] for i in sub], QA_MAX_NEW_TOKENS)
-        sub_out = {"unsteered": make_output("unsteered", sub_gen, [items[i] for i in sub])}
-        rnd = RandomDirectionPlacebo(self, N_RANDOM_DRAWS)
-        for k in range(self.budget.n_eq_draws):
-            sub_out[f"random_dir_placebo_s{k}"] = self.run_steered(rnd.intervention(k), "eq", f"random_dir_placebo_s{k}", idx=sub)
+        sub_out, sub = self._transfer_random_subset("eq", items, eq_subset_indices(items, EQ_SUBSET_N))
         self.eq_out = {"full": out, "subset": sub_out, "subset_idx": sub}
         self.timer.mark(f"entity_questions[{self.name}]")
+
+    def _transfer_random_subset(self, split, items, sub):
+        """Registered transfer-set random draws; final run: N_TRANSFER_RANDOM_DRAWS = 0 (they barely moved
+        abstention in run 2), so nothing is generated unless that constant is raised."""
+        if N_TRANSFER_RANDOM_DRAWS <= 0:
+            return {}, []
+        sub_gen = mu.generate(self.model, self.fmt, [self.prompts[split][i] for i in sub], QA_MAX_NEW_TOKENS)
+        sub_out = {"unsteered": make_output("unsteered", sub_gen, [items[i] for i in sub])}
+        rnd = RandomDirectionPlacebo(self, N_TRANSFER_RANDOM_DRAWS)
+        for k in range(N_TRANSFER_RANDOM_DRAWS):
+            sub_out[f"random_dir_placebo_s{k}"] = self.run_steered(rnd.intervention(k), split, f"random_dir_placebo_s{k}",
+                                                                   idx=sub)
+        return sub_out, sub
 
     # ------------------------------------------------------------------ phase C: TriviaQA (amendment A10)
     def triviaqa(self):
@@ -1185,14 +1264,14 @@ class ModelRunner:
         gate = MarginGatedSteer.compute_gate(base.states, self.margin["tqa"], taus[LAMBDA_PRIMARY])
         out["margin_gated_steer_knowledge"] = MarginGatedSteer.compose_outputs("margin_gated_steer_knowledge", base,
                                                                                out["knowledge_dir_steer"], gate)
-        self.budget.allow("tqa_subset_150")
+        # final F3: the dose-matched uniform push as the placebo of H1d at 70% coverage (steered margin)
+        p = self.frozen["placebos"]["placebos"]["force"]
+        L, a = self.frozen["L_star"], self.frozen["alpha"]
+        out["dose_matched_placebo_force"] = self.run_steered(
+            steer("dose_matched_placebo_force", L, self.dirs["placebos"]["force"], p["multiplier"] * a), "tqa",
+            "dose_matched_placebo_force", steered_margin=True)
         self.budget.check_emergency()
-        sub = tqa_subset_indices(items, self.budget.tqa_subset_n)
-        sub_gen = mu.generate(self.model, self.fmt, [self.prompts["tqa"][i] for i in sub], QA_MAX_NEW_TOKENS)
-        sub_out = {"unsteered": make_output("unsteered", sub_gen, [items[i] for i in sub])}
-        rnd = RandomDirectionPlacebo(self, N_RANDOM_DRAWS)
-        for k in range(self.budget.n_eq_draws):
-            sub_out[f"random_dir_placebo_s{k}"] = self.run_steered(rnd.intervention(k), "tqa", f"random_dir_placebo_s{k}", idx=sub)
+        sub_out, sub = self._transfer_random_subset("tqa", items, tqa_subset_indices(items, TQA_SUBSET_N))
         self.tqa_out = {"full": out, "subset": sub_out, "subset_idx": sub}
         print(f"TQA_COVERAGE model={self.name} unsteered_coverage={1 - _abst(base.states):.3f}", flush=True)
         self.timer.mark(f"triviaqa[{self.name}]")
@@ -1260,10 +1339,11 @@ class ModelRunner:
         for name, iv in ivs.items():
             benign[name] = rf.refusal_rate(iv, instr["alpaca_benign"])[0]
             harmful[name] = rf.refusal_rate(iv, instr["adv_heldout"])[0]
-        for k in range(N_INSTR_RANDOM_DRAWS):
+        for k in range(self.budget.count("instr_random_2", N_INSTR_RANDOM_DRAWS, 2)):
             benign[f"random_dir_placebo_s{k}"] = rf.refusal_rate(steer(f"rnd{k}", L, self.random_dirs[k], a),
                                                                  instr["alpaca_benign"])[0]
         self.side["benign_refusal_rate"] = benign
+        self.side["benign_n_prompts"] = len(instr["alpaca_benign"])
         self.side["harmful_refusal_rate"] = harmful
         self.timer.mark(f"side_effects[{self.name}]")
 
@@ -1289,8 +1369,11 @@ def dose_statistics(M, cgrid):
     monotone = np.all(np.diff(M, axis=1) <= 0.05, axis=1)
     rho = spearman(M[:, 0], c_flip)
     rng = np.random.default_rng(7)
-    boots = [spearman(M[r, 0], c_flip[r]) for r in rng.integers(0, n, size=(2000, n))]
+    boots = [spearman(M[r, 0], c_flip[r]) for r in rng.integers(0, n, size=(2000, n))] if n > 2 else [float("nan")]
+    gm = float(gain.mean()) if n else float("nan")
+    # final F6: CV with |mean| (run 2 kept the sign, giving -1.39 and 19.6 near a zero mean)
+    cv = float(gain.std(ddof=1) / abs(gm)) if n > 1 and abs(gm) > 1e-9 else float("nan")
     return {"spearman_m0_cflip": rho, "spearman_ci": [float(np.nanpercentile(boots, 2.5)), float(np.nanpercentile(boots, 97.5))],
-            "censored_fraction": float(censored.mean()), "gain_mean": float(gain.mean()),
-            "gain_cv": float(gain.std(ddof=1) / gain.mean()) if gain.mean() != 0 else float("nan"),
-            "monotone_fraction": float(monotone.mean()), "c_flip": c_flip, "m0": M[:, 0], "n_items": int(n)}
+            "censored_fraction": float(censored.mean()) if n else float("nan"), "gain_mean": gm, "gain_cv": cv,
+            "monotone_fraction": float(monotone.mean()) if n else float("nan"), "c_flip": c_flip, "m0": M[:, 0],
+            "n_items": int(n), "grid": [float(c) for c in cgrid]}
