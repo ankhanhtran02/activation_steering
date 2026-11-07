@@ -90,6 +90,8 @@ DATA_FILES = {"popqa": "popqa.jsonl", "entity_questions": "entity_questions_test
 
 # final F9: local LLM judge for every test-split output (not one of the models under test; a third
 # model size, different weights). Pinned like the models; downloaded by setup.py.
+# files fetched from every model repo by setup.py (the run.sh preflight checks the cache with the same list)
+MODEL_FILE_PATTERNS = ["*.json", "*.jinja", "*.safetensors", "tokenizer*", "*.model", "*.txt"]
 JUDGE = {"name": "qwen25_7b_instruct_judge", "hf_id": "Qwen/Qwen2.5-7B-Instruct",
          "revision": "a09a35458c702b33eeacc393d103063234e8bc28"}
 JUDGE_BATCH_SIZE = 64

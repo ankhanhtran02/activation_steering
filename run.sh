@@ -158,8 +158,35 @@ for f in DATA_FILES.values():
 if not MANIFEST_PATH.exists():
     problems.append("missing run_manifest.json (run: bash run.sh setup)")
 else:
-    for name, m in json.loads(MANIFEST_PATH.read_text())["models"].items():
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    for name, m in manifest["models"].items():
         print(f"model {name}: {m['hf_id']} @ {m['revision']}")
+    # final run: the judge loads only in phase D (after ~8 h), so check now that it is pinned and cached
+    from config import AMENDMENT_PATHS, JUDGE, MODEL_FILE_PATTERNS, PREVIOUSLY_SCORED_PATH
+    j = manifest.get("judge", {})
+    if j.get("revision") != JUDGE["revision"]:
+        problems.append(f"run_manifest.json has no judge at the pinned revision {JUDGE['revision'][:8]} "
+                        "(manifest from an earlier run; run: bash run.sh setup)")
+    else:
+        try:
+            from pathlib import Path
+            from huggingface_hub import snapshot_download
+            snap = Path(snapshot_download(JUDGE["hf_id"], revision=JUDGE["revision"], local_files_only=True,
+                                          allow_patterns=MODEL_FILE_PATTERNS))
+            idx = snap / "model.safetensors.index.json"
+            shards = sorted(set(json.loads(idx.read_text())["weight_map"].values())) if idx.exists() else \
+                [p.name for p in snap.glob("*.safetensors")]
+            missing = [s for s in shards if not (snap / s).exists()]
+            if not shards or missing:
+                problems.append(f"judge weights incomplete in the cache (missing {missing or 'all shards'}); "
+                                "run: bash run.sh setup")
+            else:
+                print(f"judge {JUDGE['hf_id']} @ {JUDGE['revision']} (cached, {len(shards)} weight files)")
+        except Exception as e:
+            problems.append(f"judge {JUDGE['hf_id']} not in the local cache ({type(e).__name__}); run: bash run.sh setup")
+    for p in [*AMENDMENT_PATHS, PREVIOUSLY_SCORED_PATH]:
+        if not p.exists():
+            problems.append(f"missing {p.name} (check out the final-run code)")
 if problems:
     print("PREFLIGHT FAILED:\n  - " + "\n  - ".join(problems))
     sys.exit(1)
@@ -176,7 +203,7 @@ ln -sfn "run_${RUN_ID}" "$OUT_ROOT/latest"
 for f in requirements.lock run_manifest.json; do [ -f "$f" ] && cp "$f" "$RUN_DIR/"; done
 [ -n "$SETUP_LOG" ] && cp "$SETUP_LOG" "$RUN_DIR/setup_log.txt"
 
-say "Running main.py into $RUN_DIR (offline; final run about 8 hours, hard limit 12 hours)"
+say "Running main.py into $RUN_DIR (offline; final run about 8-9 hours, hard limit 12 hours)"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONUNBUFFERED=1
 export STEER_OUT_DIR="$PWD/$RUN_DIR" STEER_RUN_ID="$RUN_ID"
 START=$(date +%s)
@@ -188,7 +215,9 @@ say "main.py finished with status $STATUS after $(( ($(date +%s) - START) / 60 )
 echo "Run folder:    $RUN_DIR  (also $OUT_ROOT/latest)"
 echo "Console log:   $RUN_DIR/run_log.txt"
 echo "Warnings/tracebacks: $RUN_DIR/run_stderr.txt"
+echo "Verdicts:      $RUN_DIR/verdicts.json (human tie-break rows: judge_disagreements.csv)"
 echo "Results:       $RUN_DIR/results.json, frozen_config.json, audit*.csv, per_item/, samples_*.jsonl"
-grep -E "CONDITION_FAILED|MODEL_SETUP_FAILED|MODEL_TEST_FAILED|ANALYSIS_FAILED|WARNING" "$RUN_DIR/run_log.txt" \
+grep -E "CONDITION_FAILED|MODEL_SETUP_FAILED|MODEL_TEST_FAILED|ANALYSIS_FAILED|JUDGE_FAILED|WARNING" "$RUN_DIR/run_log.txt" \
   || echo "No failures reported."
+grep -E "^VERDICT" "$RUN_DIR/run_log.txt" || echo "No VERDICT lines (see run_stderr.txt)."
 exit $STATUS

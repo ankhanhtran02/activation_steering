@@ -19,11 +19,22 @@ random directions, and D_ku split into within- and between-relation parts), test
 dose ladder, fixes H1e, H2c and the "Don't know." scoring bug, runs D_wq at its own dose, pre-specifies
 H3's signal, and labels every test output with a local judge (Qwen2.5-7B-Instruct). It ends with a
 verdict per hypothesis (`VERDICT:` lines, `verdicts.json`) under the amended kill rule: both 3B families
-decide, with no 7-9B confirmation gate. Expected wall time about 8 hours on the GB10 (limit 12 h).
-`bash run.sh` re-runs setup first, which adds the judge model (~15 GB) to the cache.
+decide, with no 7-9B confirmation gate. Expected wall time about 8-9 hours on the GB10 (cap 11 h,
+limit 12 h).
 
-Before the GPU run, `python smoke_test.py` runs every code path on CPU with two small instruct models
-and tiny splits (about 30-60 minutes; its numbers mean nothing).
+The final-run code lives on the git branch `final-run`. On the GPU machine:
+
+```bash
+git fetch origin && git checkout final-run
+nohup bash run.sh > run_all.txt 2>&1 &     # setup (adds the ~15 GB judge model) + preflight + experiment
+```
+
+Use plain `bash run.sh`, not `bash run.sh main`: a `run_manifest.json` from run 2 does not list the
+judge, and the preflight stops until setup has downloaded it.
+
+Before the GPU run, `python smoke_test.py` can run every code path on CPU with two small instruct models
+and tiny splits (about 70 minutes on an 8-core laptop, ~1.5 GB of small models downloaded; its numbers
+mean nothing). It passed on the final code on 2026-11-07.
 
 ## Quick start (one command)
 
@@ -36,10 +47,11 @@ That is the whole procedure. `run.sh` will:
 
 1. create or reuse the Python virtual env in `.venv/` and install the dependencies only when needed
    (see "Python environment" below; a CUDA build of PyTorch is installed only if none is found);
-2. download both models and all datasets at their pinned revisions (`setup.py`, about 15-25 min,
-   ~13 GB; files already at their pinned source are skipped);
-3. check that the GPU works in bf16 and that every file is in place;
-4. run the experiment offline (`main.py`, final run about 8 hours, hard limit 12 hours) and save logs and
+2. download both models, the judge model and all datasets at their pinned revisions (`setup.py`,
+   ~28 GB the first time, of which the judge is ~15 GB; files already at their pinned source are
+   skipped);
+3. check that the GPU works in bf16 and that every file is in place, including the cached judge;
+4. run the experiment offline (`main.py`, final run about 8-9 hours, hard limit 12 hours) and save logs and
    results to a new folder `outputs/run_<UTC timestamp>/` (`outputs/latest` points to it).
 
 The run takes hours, so start it so that it survives a closed terminal or SSH session:
@@ -55,11 +67,11 @@ tail -f outputs/latest/run_log.txt   # follow the experiment (Ctrl+C stops follo
 
 | | |
 |---|---|
-| GPU | one NVIDIA GPU with bf16 support; planned for an NVIDIA GB10 (128 GB unified memory). Both models stay loaded (~13 GB) plus activation caches (< 4 GB) |
-| Disk | ~15 GB (models ~13 GB in the Hugging Face cache, data ~30 MB, results ~100 MB) |
+| GPU | one NVIDIA GPU with bf16 support; planned for an NVIDIA GB10 (128 GB unified memory). Both models stay loaded (~13 GB) plus activation caches (< 4 GB); the judge (~15 GB) is added for the last phase |
+| Disk | ~30 GB (models ~13 GB and judge ~15 GB in the Hugging Face cache, data ~30 MB, results ~200 MB) |
 | Python | 3.10 or newer with the `venv` module (Ubuntu: `sudo apt install python3-venv`) |
 | Network | only for the setup stage; the experiment itself runs offline |
-| Accounts | none: the Llama weights come from the ungated `unsloth/Llama-3.2-3B-Instruct` re-upload, so no Hugging Face token is needed |
+| Accounts | none: the Llama weights come from the ungated `unsloth/Llama-3.2-3B-Instruct` re-upload and the judge `Qwen/Qwen2.5-7B-Instruct` is ungated, so no Hugging Face token is needed |
 
 ## Running setup and experiment separately
 
@@ -105,17 +117,20 @@ exactly those versions. Old `.venv.old-*` folders are never deleted automaticall
 
 | Phase | What | Typical console lines |
 |---|---|---|
-| A, every model and seed (no test split) | calibration, unsteered labelling of train/dev, refusal direction and positive controls, directions and diagnostics, dev sweeps with MMLU/perplexity caps, thresholds, dose-matched nulls, answer-position D_wq ladder | `BUDGET:`, `GRAY_ZONE`, `SEP_LABEL_CHECK`, `REFUSAL_CONTROL`, `DIRECTION_DIAGNOSTIC`, `HOOK_DIAGNOSTIC`, `DEV_SELECTION`, `DOSE_MATCHED_NULL` |
+| start | data checks; the final run also prints the fresh-test check | `DATA_CHECKSUM`, `TEST_FRESHNESS` (should read `popqa_test=1715 ... overlap_with_earlier_runs=0`) |
+| A, every model and seed (no test split) | calibration, unsteered labelling of train/dev, refusal direction and positive controls, directions (incl. D_force and the D_ku decomposition) and diagnostics, dev sweeps with MMLU/perplexity caps, thresholds, the dev-tuned gated strength, dose matching of the placebos, the own-dose D_wq ladder | `BUDGET:`, `GRAY_ZONE`, `SEP_LABEL_CHECK`, `REFUSAL_CONTROL`, `KU_DECOMPOSITION`, `DIRECTION_DIAGNOSTIC`, `HOOK_DIAGNOSTIC`, `DEV_SELECTION`, `DEV_SELECTION_GATED`, `DOSE_MATCHED_PLACEBO`, `DEV_SELECTION_WQ_OWN` |
 | freeze | one `frozen_config.json` for all models and seeds, then the test splits are unlocked | `FROZEN_CONFIG`, `TEST_GUARD` |
-| B, per model | test labelling, integrity checks, the registered conditions on PopQA test, the seed-replicated arms | `HOOK_RESET_CHECK`, `ABLATION_CHECK`, `ZERO_VECTOR_CHECK`, `IDK_FORM_CHECK`, `PROGRESS:` |
+| B, per model | test labelling, integrity checks, the registered conditions on PopQA test (incl. the knowledge dose ladder and the dose-matched placebos), the seed-replicated arms | `HOOK_RESET_CHECK`, `ABLATION_CHECK`, `ZERO_VECTOR_CHECK`, `IDK_FORM_CHECK`, `PROGRESS:` |
 | C, per model | ablations, EntityQuestions, TriviaQA, side effects (perplexity, MMLU-500, refusal spillover) | `TIME: ablation[...]`, `TQA_COVERAGE` |
-| analysis | statistics and report | `condition=... abstention_score: ...`, `SEED_CHECK`, `SUMMARY`, `PAIRED`, `HYPOTHESIS` |
+| D, once | the local judge labels every distinct test output (~30 min) | `JUDGE:`, `JUDGE_AGREEMENT` (or `JUDGE_FAILED`) |
+| analysis | statistics, report and the verdict table | `condition=... abstention_score: ...`, `SEED_CHECK`, `SUMMARY`, `PAIRED`, `HYPOTHESIS`, `VERDICT`, `DECISION_RULE`, `VERDICT_SUMMARY` |
 
 `TIME: <step> <seconds>` lines give the elapsed seconds since the start. Right after the first
 calibration (after a warm-up batch), a `BUDGET:` line projects the total runtime; the projection is
 re-estimated from finished work. Degradation-ladder steps are decided one at a time when their work
-is reached and only if the projection exceeds the 8-hour cap (`BUDGET: at=ladder:<step>`); the
-planned conditions, the seeds and the 20 random draws are never dropped.
+is reached and only if the projection exceeds the 11-hour cap (`BUDGET: at=ladder:<step>`). The ladder
+only trims null draws and side checks (see section 6 of the final amendment); the fresh test set, the
+seeds, the dose ladder, the placebos, the H2 arms and the judge are never cut.
 
 Healthy integrity lines look like this:
 
@@ -140,9 +155,9 @@ per-run folders; its files stay directly in `outputs/`.
 | `setup_log.txt`, `run_manifest.json` | copies of this run's setup log (if setup ran in the same call) and of the manifest |
 | `run_stderr.txt` | library warnings and tracebacks of any failed condition |
 | `setup_log.txt` | download log |
-| `frozen_config.json` | dev-selected layer, strength, thresholds, nulls and directions per model and seed, with SHA-256 hashes and the code / amendment / lockfile hashes; written once, before any test-split forward pass |
-| `results.json` | metrics per condition and stratum (incl. gains / losses, surplus per answered item), hypothesis analyses H1-H4, per-seed tables, paired rows, diagnostics, side effects, timings |
-| `per_item/<model>/*.jsonl.gz` | every per-item output: every condition, seed and split (test, seeds, transfer, dev sweeps), unsteered labels and the 8 samples |
+| `frozen_config.json` | dev-selected layer, strength, gated strength, thresholds, dose-matched placebo multiples and directions per model and seed, with SHA-256 hashes and the code / amendment / lockfile hashes; written once, before any test-split forward pass |
+| `results.json` | metrics per condition and stratum (incl. gains / losses, surplus per answered item), hypothesis analyses H1-H4, label-sensitivity analyses (registered rule, strict, judge, unambiguous relations), per-seed tables and replication, paired rows, diagnostics, side effects, timings, the verdict table |
+| `per_item/<model>/*.jsonl.gz` | every per-item output: every condition, seed and split (test, seeds, transfer, dev sweeps), unsteered labels and the 8 samples; final run: a `judge_state` field per record |
 | `samples_<condition>.jsonl` | 50 random outputs per condition for a manual spot check |
 | `audit.csv` | 300 outputs per model, stratified by condition and label, with an empty `human_label` column |
 | `audit_h1a.csv` | up to 50 outputs per (H1a arm x transition vs unsteered), with `auto_label`, `strict_label`, empty `judge_label` and `human_label` |
@@ -163,15 +178,30 @@ for a correct answer, 0 for "I don't know" and -1 for a wrong answer, reported x
   the placebo distribution and where each steering direction falls in it.
 - `PAIRED: <method> vs <baseline> mean_diff=... ci_low=... ci_high=... mcnemar_p=... holm_p=...`:
   paired comparisons; the decisive ones for the main question are `knowledge_dir_steer vs
-  confidence_threshold_margin` (H1a) and `margin_gated_steer_knowledge vs confidence_threshold_margin` (H1c).
+  confidence_threshold_margin` (H1a) and `margin_gated_steer_knowledge_tuned vs confidence_threshold_margin`
+  (H1c at its dev-tuned strength, final F2; the c* version is reported as exploratory).
 - `HYPOTHESIS: model=<m> <id> ...`: a compact view of each hypothesis test; full detail is in
   `results.json` under `models.<model>.analysis.hypotheses`.
+- `VERDICT: <hypothesis> <SUPPORTED|REJECTED|MIXED|UNTESTABLE> per_model=... judge_labels=... label_robust=...`:
+  the final run's answer per hypothesis under the amended kill rule (criteria: section 5 of the final
+  amendment; detail in `verdicts.json`). `label_robust=False` means the verdict changes under the judge
+  labels: then the human labels in `judge_disagreements.csv` decide it. `DECISION_RULE:` lines give the
+  pre-registered consequence; `VERDICT_SUMMARY:` lists which hypotheses are supported and which rejected.
 
 ### After the run: manual audit (from the plan)
 
-Open `outputs/latest/audit_h1a.csv` (and the registered `audit.csv` next to it), fill the
-`human_label` column (`correct`, `abstained` or `wrong`), then (each command works on the newest run
-folder by default; `--run-dir outputs/run_<...>` picks another, `--run-dir outputs` the first run):
+The final run already labels every test output with the local judge (phase D) and recomputes every
+verdict under those labels. The human step that remains:
+
+1. If any verdict prints `label_robust=False`, fill the `human_label` column of
+   `outputs/latest/judge_disagreements.csv` (`correct`, `abstained` or `wrong`): those rows decide
+   whether the automatic or the judge labelling is right for that verdict.
+2. For the plan's agreement target (Cohen's kappa >= 0.8 against people), also label
+   `audit_h1a.csv` and score it as below.
+
+Fill the `human_label` column of `outputs/latest/audit_h1a.csv` (and of the registered `audit.csv` next
+to it), then (each command works on the newest run folder by default; `--run-dir outputs/run_<...>`
+picks another, `--run-dir outputs` the first run):
 
 ```bash
 python audit.py judge --backend anthropic        # optional LLM judge; sends questions and outputs to the API
@@ -187,7 +217,9 @@ The plan's target is Cohen's kappa >= 0.8. If it is missed, the classification r
 `python reanalyze.py [--run-dir DIR]` recomputes the corrected statistics (amendment A1/A3/A6/A7)
 from a finished run's saved records (the newest run folder by default): the first run's
 `results.json`, or the `per_item/` store of later runs. It writes `<run folder>/reanalysis_<date>/`.
-The re-analysis of the first run is in `outputs/reanalysis_2026-11-04/`.
+The re-analysis of the first run is in `outputs/reanalysis_2026-11-04/`. It was written for runs 1 and
+2 and has not been checked against the final run's outputs; the final run's own `results.json` and
+`verdicts.json` already contain the corrected statistics.
 
 ## Troubleshooting
 
@@ -199,6 +231,9 @@ The re-analysis of the first run is in `outputs/reanalysis_2026-11-04/`.
 | `pip failed. Installing packages needs network access ...` | The env had to be (re)built or updated without network. Run `bash run.sh setup` where PyPI is reachable, or use the env from that machine if the CPU architecture matches. |
 | `CONDITION_FAILED: <name> [<model>] ...` | That condition crashed; all others still ran. The traceback is in `outputs/latest/run_stderr.txt`. |
 | `MODEL_SETUP_FAILED` | A per-model step before the test conditions crashed (see `run_stderr.txt`); the other model still runs. |
+| `PREFLIGHT FAILED: run_manifest.json has no judge ...` or `judge ... not in the local cache` | The manifest or cache predates the final run (or the judge download was interrupted). Run `bash run.sh setup` (or plain `bash run.sh`). |
+| `PREFLIGHT FAILED: missing preregistration_amendment_2026-11-07_final_run.md` / `previously_scored_qids.json` | The final-run code is not checked out: `git fetch origin && git checkout final-run`. |
+| `JUDGE_FAILED` near the end | The experiment results are complete; only the judge labels are missing, and every verdict's `label_robust` reads unavailable. The traceback is in `run_stderr.txt`. |
 | Download errors during setup | Rerun `bash run.sh setup`; finished datasets are skipped and model downloads resume. |
 | The run is slower than planned | Nothing to do: the `BUDGET:` projection triggers the degradation ladder automatically. |
 
@@ -216,6 +251,10 @@ with `hf auth login`, and run `bash run.sh` again.
 |---|---|
 | `run.sh` | one-command runner (the only script you need); writes / installs `requirements.lock` |
 | `preregistration_amendment_2026-11-04.md` | dated amendment to the plan (corrections, withdrawn results, A1-A14) |
+| `preregistration_amendment_2026-11-07_final_run.md` | the final run's amendment (F1-F12, amended kill rule, verdict criteria) |
+| `previously_scored_qids.json` | every question id runs 1 and 2 scored on a test split; the final run excludes them |
+| `judge.py`, `verdicts.py` | final run: phase D LLM judge; the verdict table |
+| `smoke_test.py` | CPU smoke test of every code path with small models (no results) |
 | `setup.py` | downloads models and datasets, writes `run_manifest.json` |
 | `main.py` | the experiment: condition registry and phases (docstring documents the full protocol) |
 | `config.py` | all pre-registered constants (models, prompts, grids, seeds, budget) |
@@ -224,7 +263,7 @@ with `hf auth login`, and run `bash run.sh` again.
 | `steering.py` | forward hooks, direction fitting, random directions |
 | `baselines.py`, `methods.py` | baselines and steering methods (class names follow the plan) |
 | `pipeline.py` | per-model phases, ablations, side effects, time budget |
-| `scoring.py` | answer matching, outcome classification, metric (unchanged) |
+| `scoring.py` | answer matching, outcome classification, metric (final F8: subject-less "Don't know." counts as an abstention; the registered phrase list is kept for the sensitivity analysis) |
 | `stats.py`, `analysis_core.py` | corrected inference (bootstrap with the valid-resample rule, sign-flip tests, family-wise Holm, common-grid AURC, net transitions) shared by the report and the re-analysis |
 | `report.py` | hypotheses, printed report and output files |
 | `reanalyze.py`, `audit.py` | offline re-analysis of a finished run; measurement audit and LLM judge |

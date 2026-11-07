@@ -16,7 +16,7 @@ import urllib.request
 import zipfile
 from importlib import metadata
 
-from config import DATA_DIR, DATA_FILES, DATASET_PINS, EQ_RELATIONS, JUDGE, MANIFEST_PATH, MODELS
+from config import DATA_DIR, DATA_FILES, DATASET_PINS, EQ_RELATIONS, JUDGE, MANIFEST_PATH, MODEL_FILE_PATTERNS, MODELS
 
 
 def write_jsonl(path, rows):
@@ -60,7 +60,7 @@ def _snapshot(spec):
     from huggingface_hub import snapshot_download
     path = snapshot_download(
         spec["hf_id"], revision=spec["revision"],
-        allow_patterns=["*.json", "*.jinja", "*.safetensors", "tokenizer*", "*.model", "*.txt"],
+        allow_patterns=MODEL_FILE_PATTERNS,
         token=os.environ.get("HF_TOKEN"))
     got = os.path.basename(path)
     if got != spec["revision"]:
