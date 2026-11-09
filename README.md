@@ -1,5 +1,12 @@
 # Activation steering for hallucination mitigation
 
+> **New direction (2026-11-09, branch `pilot-confidence-rule`):** a pilot asking whether activation
+> steering does anything a confidence rule can't, in five sub-questions with go / stop signals, on
+> Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct within 12 GB10-hours. Start at
+> [pilot/README.md](pilot/README.md) (`bash run_pilot.sh`); the protocol is
+> [pilot/PREREGISTRATION.md](pilot/PREREGISTRATION.md). The rest of this README describes the earlier
+> study, whose code the pilot reuses (`model_utils.py`, `steering.py`, `scoring.py`, unchanged).
+
 Screening-tier experiment from `experiment_plan.yaml`: *does hallucination steering beat its own
 detector?* Two frozen ~3B instruction models (Llama-3.2-3B-Instruct, Qwen2.5-3B-Instruct) are
 steered at inference time with difference-of-means directions and compared against a confidence
