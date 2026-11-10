@@ -92,7 +92,7 @@ def load_wikidata_countries():
     out = {}
     for r in read_jsonl(PC.DATA_FILES["wikidata_country"]):
         # Wikidata aliases include ISO codes ("se", "ao") that whole-word matching could hit by accident
-        aliases = [a for a in r.get("aliases", []) if len(normalize_answer(a)) > 2 or normalize_answer(a) in ("us", "uk")]
+        aliases = [a for a in r.get("aliases") or [] if a and len(normalize_answer(a)) > 2 or normalize_answer(a) in ("us", "uk")]
         names = [r["country_label"]] + aliases
         names += COUNTRY_EXTRA_ALIASES.get(r["country_label"], [])
         out.setdefault(r["city_qid"], [])
@@ -118,7 +118,7 @@ def build_pool():
     by_rel = {rel: [] for rel in PC.POPQA_QUOTAS}
     for r in read_jsonl(PC.DATA_FILES["popqa_full"]):
         qid = f"popqa_{r['id']}"
-        if r["prop"] in by_rel and r["subj"].strip() and qid not in prev["popqa_test"]:
+        if r["prop"] in by_rel and (r["subj"] or "").strip() and qid not in prev["popqa_test"]:
             by_rel[r["prop"]].append(r)
     pop_items = []
     for rel in sorted(PC.POPQA_QUOTAS):
@@ -128,7 +128,7 @@ def build_pool():
         for i in rng.permutation(len(cand))[:PC.POPQA_QUOTAS[rel]]:
             r = cand[i]
             pop_items.append(QAItem(qid=f"popqa_{r['id']}", question=r["question"],
-                                    aliases=[a for a in r["possible_answers"] if a.strip()], dataset="popqa",
+                                    aliases=[a for a in r["possible_answers"] or [] if a and a.strip()], dataset="popqa",
                                     subj=r["subj"], subj_id=int(r["subj_id"]), prop=rel,
                                     log_pop=float(np.log10(int(r["s_pop"]) + 1)),
                                     extra={"group": f"popqa_subj_{r['subj_id']}", "obj": r.get("obj", ""),
@@ -143,10 +143,10 @@ def build_pool():
         if qid in excluded or qid in seen:
             continue
         seen.add(qid)
-        aliases = [a for a in dict.fromkeys(list(r["aliases"]) + [r["value"]]) if a and a.strip()]
+        aliases = [a for a in dict.fromkeys(list(r["aliases"] or []) + [r["value"]]) if a and a.strip()]
         it = QAItem(qid=qid, question=r["question"], aliases=aliases, dataset="tqa", prop="triviaqa",
                     extra={"group": qid, "value": r["value"]})
-        is_year = bool(YEAR_RE.match(r["value"].strip())) and bool(YEAR_Q_RE.search(r["question"]))
+        is_year = bool(YEAR_RE.match((r["value"] or "").strip())) and bool(YEAR_Q_RE.search(r["question"] or ""))
         (years if is_year else others).append(it)
     if len(years) < PC.N_SQ5_YEAR:
         raise RuntimeError(f"only {len(years)} TriviaQA year questions < {PC.N_SQ5_YEAR}")
@@ -208,7 +208,7 @@ def build_ext_pool(pool):
     by_rel = {rel: [] for rel in PC.EXT_POPQA_QUOTAS}
     for r in read_jsonl(PC.DATA_FILES["popqa_full"]):
         qid = f"popqa_{r['id']}"
-        if (r["prop"] in by_rel and r["subj"].strip() and qid not in prev["popqa_test"] and qid not in used
+        if (r["prop"] in by_rel and (r["subj"] or "").strip() and qid not in prev["popqa_test"] and qid not in used
                 and int(r["subj_id"]) not in used_subj):
             by_rel[r["prop"]].append(r)
     items, shortfall = [], {}
@@ -225,7 +225,7 @@ def build_ext_pool(pool):
                 continue
             seen_subj.add(int(r["subj_id"]))
             items.append(QAItem(qid=f"popqa_{r['id']}", question=r["question"],
-                                aliases=[a for a in r["possible_answers"] if a.strip()], dataset="popqa",
+                                aliases=[a for a in r["possible_answers"] or [] if a and a.strip()], dataset="popqa",
                                 subj=r["subj"], subj_id=int(r["subj_id"]), prop=rel,
                                 extra={"group": f"popqa_subj_{r['subj_id']}", "fold": PC.EXT_FOLD}))
     tqa_rows = read_jsonl(PC.DATA_FILES["triviaqa"])
@@ -237,7 +237,7 @@ def build_ext_pool(pool):
             continue
         seen.add(qid)
         cand.append(QAItem(qid=qid, question=r["question"], dataset="tqa", prop="triviaqa",
-                           aliases=[a for a in dict.fromkeys(list(r["aliases"]) + [r["value"]]) if a and a.strip()],
+                           aliases=[a for a in dict.fromkeys(list(r["aliases"] or []) + [r["value"]]) if a and a.strip()],
                            extra={"group": qid, "fold": PC.EXT_FOLD}))
     items += [cand[i] for i in rng.permutation(len(cand))[:PC.N_EXT_TQA]]
     items.sort(key=lambda it: qid_hash(it.qid))
