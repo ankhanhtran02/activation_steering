@@ -193,19 +193,19 @@ def sq5_pooled(per_model_results):
 def grading_model(rows):
     """Two-stage plan (config): stage 1 decides unless it is ambiguous; then stage 2 rows are needed."""
     def disagreements(rs):
-        return sum(r["human_label"].strip().lower() != r["auto_label"].strip().lower() for r in rs)
-    s1 = [r for r in rows if r["stage"].strip() == "1"]
-    s2 = [r for r in rows if r["stage"].strip() == "2"]
-    if not s1 or any(not r["human_label"].strip() for r in s1):
-        return {"status": "PENDING", "stage": 1, "n_filled": sum(bool(r["human_label"].strip()) for r in s1), "n": len(s1)}
+        return sum((r["human_label"] or "").strip().lower() != (r["auto_label"] or "").strip().lower() for r in rs)
+    s1 = [r for r in rows if (r["stage"] or "").strip() == "1"]
+    s2 = [r for r in rows if (r["stage"] or "").strip() == "2"]
+    if not s1 or any(not (r["human_label"] or "").strip() for r in s1):
+        return {"status": "PENDING", "stage": 1, "n_filled": sum(bool((r["human_label"] or "").strip()) for r in s1), "n": len(s1)}
     x1 = disagreements(s1)
     if x1 <= PC.GRADING_STAGE1_PASS_MAX:
         return {"status": "OK", "stage": 1, "disagreements": x1, "n": len(s1), "disagreement_rate": x1 / len(s1)}
     if x1 >= PC.GRADING_STAGE1_FAIL_MIN:
         return {"status": "FAIL", "stage": 1, "disagreements": x1, "n": len(s1), "disagreement_rate": x1 / len(s1)}
-    if not s2 or any(not r["human_label"].strip() for r in s2):
+    if not s2 or any(not (r["human_label"] or "").strip() for r in s2):
         return {"status": "NEED_STAGE2", "stage": 1, "disagreements": x1, "n": len(s1),
-                "n_stage2_filled": sum(bool(r["human_label"].strip()) for r in s2), "n_stage2": len(s2)}
+                "n_stage2_filled": sum(bool((r["human_label"] or "").strip()) for r in s2), "n_stage2": len(s2)}
     x = x1 + disagreements(s2)
     ok = x <= round(PC.GRADING_MAX_DISAGREE * (len(s1) + len(s2)))     # 10 of 200
     return {"status": "OK" if ok else "FAIL", "stage": 2, "disagreements": x, "n": len(s1) + len(s2),
@@ -232,10 +232,10 @@ def rewording_status(run_dir):
     if not p.exists():
         return {"status": "MISSING"}
     rows = list(csv.DictReader(open(p, encoding="utf-8")))
-    filled = [r for r in rows if r["meaning_preserved"].strip()]
+    filled = [r for r in rows if (r["meaning_preserved"] or "").strip()]
     if len(filled) < len(rows):
         return {"status": "PENDING", "n_filled": len(filled), "n": len(rows)}
-    bad = [r for r in filled if r["meaning_preserved"].strip().lower() not in ("yes", "y", "1", "true")]
+    bad = [r for r in filled if (r["meaning_preserved"] or "").strip().lower() not in ("yes", "y", "1", "true")]
     return {"status": "OK" if not bad else "FAIL", "n": len(filled), "n_not_preserved": len(bad),
             "templates_not_preserved": sorted({(r["relation"], r["template"]) for r in bad})}
 
