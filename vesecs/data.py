@@ -32,6 +32,19 @@ def _text_key(q):
     return " ".join(str(q).split()).casefold()
 
 
+def _clean_aliases(seq):
+    """Non-empty alias strings. Raw dataset fields can be null (three PopQA rows have subj = null; the same
+    fix as pilot/data.py, commit b7d9bc8): a missing list or value counts as empty instead of raising."""
+    return [a for a in seq or [] if a and a.strip()]
+
+
+def _popqa_keep(r, rels):
+    """Gold aliases if PopQA row r is in one of the relations and has a subject, else None."""
+    if r["prop"] not in rels or not (r["subj"] or "").strip():
+        return None
+    return _clean_aliases(r["possible_answers"]) or None
+
+
 def _name_key(s):
     from scoring import normalize_answer
     return normalize_answer(s or "")
@@ -154,14 +167,14 @@ def build_splits(cfg):
     elig = []
     for r in sorted(popqa, key=lambda r: int(r["id"])):
         qid = f"popqa_{r['id']}"
-        aliases = [a for a in r["possible_answers"] if a.strip()]
-        if r["prop"] not in rels or not r["subj"].strip() or not aliases or qid in excluded:
+        aliases = _popqa_keep(r, rels)
+        if aliases is None or qid in excluded:
             continue
         pk = _pair_keys(r["subj_id"], obj_id_of(r), r["subj"], r["obj"])
         if int(r["subj_id"]) in used_subj or (pk & used_pairs):
             continue
         elig.append({"qid": qid, "source": "popqa", "relation": r["prop"], "question": r["question"],
-                     "aliases": aliases, "subj": r["subj"], "subj_id": int(r["subj_id"]), "obj": r.get("obj", ""),
+                     "aliases": aliases, "subj": r["subj"], "subj_id": int(r["subj_id"]), "obj": r.get("obj") or "",
                      "obj_id": obj_id_of(r), "_pairs": pk})
     rng = np.random.default_rng(seed)
     elig = [elig[i] for i in rng.permutation(len(elig))]
@@ -192,7 +205,7 @@ def build_splits(cfg):
         if qid in excluded or qid in seen:
             continue
         seen.add(qid)
-        aliases = [a for a in dict.fromkeys(list(r["aliases"]) + [r["value"]]) if a and a.strip()]
+        aliases = _clean_aliases(dict.fromkeys(list(r["aliases"] or []) + [r["value"]]))
         if not aliases:
             continue
         tqa.append({"qid": qid, "source": "tqa", "relation": TQA_RELATION, "question": r["question"],

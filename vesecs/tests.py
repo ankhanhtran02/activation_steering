@@ -214,8 +214,24 @@ def test_budget_cuts():
         assert b2.scale(10000.0) == 4.0, "scale is clamped"
 
 
+def test_null_fields():
+    """Null dataset fields (three PopQA rows have subj = null) are treated as empty instead of raising."""
+    from vesecs.data import _clean_aliases, _pair_keys, _popqa_keep
+    rels = ["capital"]
+    row = {"prop": "capital", "subj": "France", "possible_answers": ["Paris", " ", None, ""]}
+    assert _popqa_keep(row, rels) == ["Paris"]
+    assert _popqa_keep({**row, "subj": None}, rels) is None, "null subject is dropped"
+    assert _popqa_keep({**row, "subj": "  "}, rels) is None, "blank subject is dropped"
+    assert _popqa_keep({**row, "possible_answers": None}, rels) is None, "no answers is dropped"
+    assert _popqa_keep({**row, "prop": "author", "subj": None}, rels) is None
+    assert _clean_aliases(dict.fromkeys(list(None or []) + [None])) == []
+    assert _clean_aliases(["a", "a ", "", None]) == ["a", "a "]
+    assert _pair_keys(1, 2, None, "Paris") == {("id", 1, 2)}
+
+
 TESTS = [test_ves_verdicts, test_ecs_verdicts, test_grader, test_fit_family_matches_sq2, test_primal_equals_dual,
-         test_vector_probe_forms, test_replay_exact, test_methods_small, test_bootstrap, test_budget_cuts]
+         test_vector_probe_forms, test_replay_exact, test_methods_small, test_bootstrap, test_budget_cuts,
+         test_null_fields]
 VERDICT_TESTS = {"test_ves_verdicts", "test_ecs_verdicts"}
 
 

@@ -92,7 +92,7 @@ def load_wikidata_countries():
     out = {}
     for r in read_jsonl(PC.DATA_FILES["wikidata_country"]):
         # Wikidata aliases include ISO codes ("se", "ao") that whole-word matching could hit by accident
-        aliases = [a for a in r.get("aliases") or [] if a and len(normalize_answer(a)) > 2 or normalize_answer(a) in ("us", "uk")]
+        aliases = [a for a in r.get("aliases") or [] if a and (len(normalize_answer(a)) > 2 or normalize_answer(a) in ("us", "uk"))]
         names = [r["country_label"]] + aliases
         names += COUNTRY_EXTRA_ALIASES.get(r["country_label"], [])
         out.setdefault(r["city_qid"], [])
