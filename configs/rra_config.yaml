@@ -1,0 +1,105 @@
+# Recoverability-Routed Answering (rra-experiment-design.tex): every grid, seed, path and budget figure in one
+# place. Code: rra/. Anything not set here is taken unchanged from the SQ2 pilot code (pilot/, model_utils.py,
+# scoring.py) and the VES/ECS code (vesecs/). Paths are relative to the repository root.
+
+seed: 0                                   # global seed (Appendix A)
+
+paths:
+  # The VES/ECS run whose frozen detector D, dev/test drafts, states and B7 round-1 records are reused.
+  # Found automatically (run_rra.sh); env RRA_VES_RUN_DIR overrides.
+  ves_run_dir: outputs_ves/run_20261115T053802Z
+  # The SQ2 pilot run (pool answers, labels, folds, hidden states). Default: the folder named in the VES run's
+  # sq2_run_dir.txt; env RRA_SQ2_RUN_DIR overrides.
+  sq2_run_dir: outputs_pilot/run_20261110T010318Z
+  out_root: outputs_rra                   # each run writes outputs_rra/run_<UTC>/ (env RRA_OUT_DIR overrides)
+  popqa_ids_file: ves_popqa_ids.jsonl     # in data_cache/: PopQA id columns (vesecs.setup_data)
+
+models: [llama31_8b_instruct, qwen25_7b_instruct]   # specs and pinned revisions: pilot/config.py
+
+depths: [0.25, 0.40, 0.50, 0.60, 0.75]    # SQ2 depths (states recorded at all five)
+
+data:                                     # fresh dev and test questions (spec section 5)
+  tqa_dev: 700
+  tqa_test: 2800
+  popqa_relations: [occupation, director, producer, screenwriter, composer, author]
+  popqa_dev_per_relation: 50
+  popqa_test_per_relation: 200
+  shuffle_seed: 0
+
+decoding:
+  max_new_tokens: 16                      # A1 and A2: greedy, at most 16 tokens
+  batch_size: 64                          # SQ2's batch size (greedy, token-ban and teacher-forced passes)
+  n_tries: 10                             # optional stage E2: tries 1-10
+  tries_prompts_per_batch: 32
+
+thresholds:
+  quantile_step: 0.05                     # tuning-set quantiles at 5% steps, plus -inf and +inf
+
+lambdas: [1, 3]                           # U_1 primary, U_3 sensitivity (thresholds re-tuned for each)
+
+fpe: {base: 1.0, generation: 1.0, scoring: 0.5}   # FPE as in the VES/ECS spec
+
+stats:
+  n_boot: 2000
+  boot_seed: 7                            # SQ2's bootstrap seed
+  min_valid_frac: 0.95
+
+rules:                                    # spec section 8 (pooled, fresh test)
+  min_recoverable: 150                    # per model: A1 wrong and A2 right
+  h_stop: 2.0                             # STOP if CI upper bound of H < 2.0
+  main_go: 1.0                            # Delta_main >= 1.0 with CI lower bound > 0 (STOP if CI upper < 1.0)
+  mech_go: 0.5                            # Delta_mech >= 0.5 with CI lower bound > 0 (STOP if CI upper < 0)
+
+strata:
+  confident_error_min_match: 8            # A1 wrong and >= 8 of tries 1-10 match A1 (optional stage E2)
+
+checks:
+  state_verify_n: 50                      # pool answers teacher-forced again (first SQ2 batch, compare 50)
+  sq2_batch_size: 64                      # batch size of the SQ2 run's passes (same composition = exact states)
+  ves_batch_size: 64                      # batch size of the VES/ECS run's passes (VES/ECS sets: states, B7)
+  state_verify_tol: 0.01
+  frozen_D_tol: 0.001                     # recomputed s1 vs stored VES/ECS scores
+  b3_replay_expected: 39.0                # spec value; the VES/ECS summary.json value is used when present
+  b3_replay_tol: 0.05
+  fallback_verify_n: 50
+  fallback_max_diff_rate: 0.02            # above this, the rate is reported (stored A2 is always used for replay)
+  shuffled_range: [0.45, 0.55]
+  oom_retries: 3                          # failure policy: halve the batch size, up to 3 times, then stop
+  load_retry_wait_s: [30, 60, 120]
+
+audit_n: 100                              # routed retries per model for the hand check
+
+optional:
+  E2: true                                # tries 1-10 on the fresh test (confident-error stratum)
+  G: true                                 # Gemma-2-9B-it end to end (reported separately)
+
+gemma:                                    # optional stage G (ungated mirror of google/gemma-2-9b-it, pinned)
+  name: gemma2_9b_it
+  hf_id: unsloth/gemma-2-9b-it
+  revision: fc7d4737cda11c3a19af2b722319e846670b4d89
+  n_layers: 42
+  d_model: 3584
+  n_heads: 16
+  head_dim: 256
+  attn_implementation: eager              # Gemma-2's attention soft-capping needs eager attention
+
+budget:
+  project_limit_hours: 10.5               # optional stages are cut only if the measured projection exceeds this
+  hard_stop_hours: 11.5                   # no stage starts after this
+  timing_probe_n: 128
+  cut_order: [G, E2]                      # G (larger, reported separately) is cut before E2
+  analysis_reserve_s: 300
+
+# CPU smoke test (RRA_SMOKE=1, rra/smoke_test.py): tiny models, tiny splits. Numbers mean nothing.
+smoke_overrides:
+  data: {tqa_dev: 8, tqa_test: 20, popqa_dev_per_relation: 2, popqa_test_per_relation: 4}
+  decoding: {max_new_tokens: 8, batch_size: 16, n_tries: 4, tries_prompts_per_batch: 8}
+  stats: {n_boot: 200}
+  rules: {min_recoverable: 1, h_stop: 2.0, main_go: 1.0, mech_go: 0.5}
+  checks: {state_verify_n: 8, fallback_verify_n: 8, shuffled_range: [0.0, 1.0], b3_replay_tol: 0.05,
+           load_retry_wait_s: [1, 1, 1], ves_batch_size: 16}
+  strata: {confident_error_min_match: 3}
+  audit_n: 10
+  gemma: {name: gemma2_2b_smoke, hf_id: unsloth/gemma-2-2b-it, revision: 457f2e15bf550c227ce6ad86e2ec108d3e42c106,
+          n_layers: 26, d_model: 2304, n_heads: 8, head_dim: 256}     # same tokenizer / template family as the 9B
+  budget: {timing_probe_n: 16, project_limit_hours: 1000, hard_stop_hours: 1000}

@@ -1,0 +1,448 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt, topsep=4pt}
+\renewcommand{\arraystretch}{1.15}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\IDK}{\textsc{idk}}
+\newcommand{\note}[1]{%
+  \begin{quote}\small\color{black!75}\textit{Note.} #1\end{quote}}
+
+\title{Recoverability-Routed Answering (RRA)\\[2pt]
+\large Method and Experiment Design (Implementation Specification)}
+\author{Khanh Tran}
+\date{15 November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+The VES/ECS experiment showed that the weak link is the \emph{checker}: retries find a right answer for
+roughly a quarter to a third of wrong drafts, but the hidden-state detector cannot tell right retries from wrong
+ones, so retries add as many wrong answers as right ones. Recent work reports the same pattern: hidden-state
+probes are good at ``how certain am I?'' and poor at ``which of these answers is right?''.
+\textbf{RRA} turns the second kind of decision into the first. It never checks a retry. Instead, it predicts
+\emph{before retrying}, from the hidden states of the model's first answer, whether the model's next-best
+answer would be right. For each question it then chooses one of three actions: keep the first answer, switch to
+the next-best answer, or say ``I don't know''. The experiment reuses the SQ2 and VES/ECS setup and artifacts,
+runs on one NVIDIA GB10 within 12 hours (planned: about 3.3 hours for the required stages, about 6.3 hours
+with all optional stages), and ends with a
+GO / BORDERLINE / STOP verdict. Where a detail is not stated, \textbf{reuse the SQ2 and VES/ECS code unchanged}.
+\end{abstract}
+
+%======================================================================
+\section{Purpose and lessons from VES and ECS}
+%======================================================================
+
+\paragraph{The question.} Can the model's hidden states decide \emph{when a retry will work}, well enough to
+beat the existing detector gate (B3, score 39.0 on the VES/ECS test set)?
+
+\paragraph{Design principle.} \emph{Decide with hidden states, act with text.} Hidden states supply the decision
+signal. The actions (keep, switch, \IDK) are plain text outputs. Activation steering is not used as an action,
+because the VES/ECS run showed that steering-based generation was no better than banning one word.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}LL@{}}
+\toprule
+Weakness observed in the VES/ECS run & How RRA avoids it \\
+\midrule
+The detector could not separate right retries from wrong ones (Llama +62 right, +71 wrong; Qwen +68, +75). &
+RRA never scores a retry. It predicts the retry's correctness from the \emph{first} answer's states, a
+question-level ``how certain'' judgement, which is what probes do well. \\
+Steering found right answers no more often than banning the first word, at higher cost. &
+The fallback is the cheapest generator: ban the first token of the first answer, decode greedily once. \\
+Mid-layer token decoding (logit lens) failed: 2\% agreement on Llama, 0\% on Qwen. &
+No mid-layer decoding. RRA reads only the before and after states at the SQ2 depths. \\
+The early ``echo'' verdict was weaker than the after-answer detector. &
+RRA reads the after-answer state of the real first answer, the strongest signal SQ2 found. \\
+Retries were applied to every flagged question. &
+RRA retries only where its recoverability probe predicts success; elsewhere it keeps or abstains. \\
+The budget guard cut stages on a wrong projection; a GPU memory error skipped an integrity check. &
+Projections use measured rates only; only stages marked optional can be cut; failed checks are retried with
+smaller batches and otherwise stop the run (Section~\ref{sec:budget}). \\
+\bottomrule
+\end{tabularx}
+\caption{Lessons carried into this design.}
+\end{table}
+
+%======================================================================
+\section{Method: Recoverability-Routed Answering}
+%======================================================================
+
+\paragraph{In plain terms.} The model answers once. From the hidden states of that single pass, two probes
+estimate two things: is this answer right? And, if we made the model answer differently, would its next-best
+answer be right? If the first looks right, keep it. If not, but the next-best looks likely to be right, generate
+it and give it, \emph{without checking it}. Otherwise say ``I don't know''. A retry costs one short extra
+generation, and only on questions where it is predicted to pay off.
+
+\subsection{Definitions}
+\begin{itemize}
+  \item $A_1$: greedy answer (SQ2 prompt and decoding). If $A_1$ is \IDK, every method outputs \IDK.
+  \item $A_2$: the \emph{fallback}. Greedy decoding with the first token of $A_1$ banned at the first answer step
+        only, at most 16 tokens. This is exactly round 1 of baseline B7 in the VES/ECS run.
+  \item \textbf{Null fallback}: $A_2$ is \IDK, garbled or hedged (the grader's syntactic checks, which use no
+        gold answers), or equals $A_1$ after normalisation, or one contains the other. A null fallback is
+        output as \IDK.
+  \item $h_b$, $h_a$: before state (last prompt token) and after state (last answer token) of $A_1$ from the clean
+        scoring pass, at the SQ2 depths (25, 40, 50, 60, 75\%).
+  \item $s_1$: the frozen SQ2 detector $D$'s score for $A_1$ (identical to B3's score).
+  \item $s_2$: the \textbf{recoverability probe} $R$'s score, computed from the same $h_b, h_a$.
+\end{itemize}
+
+\subsection{The recoverability probe \texorpdfstring{$R$}{R}}
+\begin{itemize}
+  \item \textbf{Label}: $y_2 = 1$ if the retry action yields a right answer, i.e.\ $A_2$ is not null and is graded
+        right by the strict grader; otherwise 0.
+  \item \textbf{Input and recipe}: the SQ2 detector recipe unchanged. Ridge probe; depth, moment
+        (before / after / both) and ridge strength chosen by leave-one-out AUROC; trained on all answered pool
+        questions.
+  \item \textbf{Key property}: $R$ is evaluated \emph{before} $A_2$ exists. It never sees $A_2$'s states.
+\end{itemize}
+
+\subsection{Decision rule (primary)}\label{sec:rule}
+With thresholds $\tau_1, \tau_2$ tuned on the tuning set (Section~\ref{sec:data}):
+\begin{enumerate}
+  \item If $A_1$ is \IDK: output \IDK.
+  \item If $s_1 \ge \tau_1$: output $A_1$.
+  \item Else if $s_2 \ge \tau_2$: generate $A_2$; output $A_2$, or \IDK{} if $A_2$ is null.
+  \item Else: output \IDK.
+\end{enumerate}
+Compute: 1 FPE per question, plus 1 generation for each routed retry (FPE as in the VES/ECS spec).
+
+\subsection{Variants (reported, not used for the verdict unless stated)}\label{sec:variants}
+\begin{itemize}
+  \item \textbf{RRA-EU}: Platt-scale $s_1$ and $s_2$ to probabilities $p_1, p_2$ using cross-fitted pool scores.
+        Choose the action maximising expected utility:
+        $\max\{(1{+}\lambda)p_1 - \lambda,\; (1{+}\lambda)p_2 - \lambda,\; 0\}$ for keep, retry and \IDK.
+        No threshold tuning.
+  \item \textbf{RRA+check}: as RRA, but a routed $A_2$ must also pass $D(A_2) \ge \tau_3$. This tests whether
+        adding the candidate-level check helps or hurts.
+  \item \textbf{RRA-peer} (exploratory, two models): the fallback is the \emph{other} model's greedy answer.
+        Retry if that model's own detector score on its own answer $\ge \tau_p$. This costs two models'
+        compute and is reported only as a pointer to a possible follow-up.
+\end{itemize}
+
+%======================================================================
+\section{Novelty positioning}
+%======================================================================
+
+A targeted literature search on 15 November 2026 found close neighbours but not this method.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lLL@{}}
+\toprule
+Work & What it does & Difference from RRA \\
+\midrule
+Calibration, not answer selection (arXiv 2609.33290) & Shows hidden-state probes are well calibrated but
+  poor at choosing among sampled answers & Motivates RRA; RRA turns choosing into a calibration-type decision \\
+Decodability criterion (arXiv 2608.17124) & Within-question ranking AUC predicts when probe selection beats
+  majority voting & Studies selection among candidates; RRA avoids candidate selection \\
+Inside-Out / Orgad et al.\ & Probes select correct answers among sampled candidates & Candidate-level scoring \\
+WACK: ignorance vs error & Classifies ``knows but errs'' vs ``does not know'' from internals; tailors mitigation &
+  RRA predicts the correctness of one specific, cheap fallback and decides keep / switch / abstain \\
+Internal confidence and self-correction (arXiv 2604.22271) & An internal signal predicts which errors
+  self-correction can fix & Self-correction by prompting, not a deterministic fallback with abstention \\
+What Am I Missing? (arXiv 2605.31561) & A probe predicts the benefit of asking a clarifying question & Different
+  intervention and setting (student--teacher) \\
+Multi-LLM abstention (ACL 2024) & Models probe each other in text to decide abstention & Text-level; RRA is
+  single-model (RRA-peer is exploratory) \\
+\bottomrule
+\end{tabularx}
+\caption{Closest work. Re-run the search before any submission.}
+\end{table}
+
+\noindent\textbf{Claimed contribution}: deciding whether to retry \emph{from the draft's hidden states},
+predicting the correctness of a fallback that does not yet exist, combined with abstention in a single
+expected-utility decision, so that no candidate-level checking is needed.
+
+%======================================================================
+\section{Reused setup and artifacts}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Item & Source \\
+\midrule
+Models, precision, prompt, decoding & SQ2: Llama-3.1-8B-Instruct (\texttt{unsloth}, rev.\ \texttt{4699cc75}),
+  Qwen2.5-7B-Instruct (rev.\ \texttt{a09a3545}), bf16, greedy $\le 16$ tokens \\
+Grader & Strict grader from the VES/ECS spec (SQ2 grader + hedge rule) \\
+Detector $D$ & The frozen $D$ from the VES/ECS run (\texttt{frozen\_config.json}); do not refit \\
+Pool & SQ2 pool: answers, labels, fold ids, hidden states at 5 depths \\
+Previous dev and test & VES/ECS per-question records: $A_1$, states, $s_1$, B7 rounds with clean $D$ scores,
+  tries \\
+Token ban & B7's logits processor (ban at the first generated step only) \\
+Statistics, verdict vocabulary & Paired bootstrap, 2,000 resamples over questions, both models together;
+  INSUFFICIENT\_DATA / GO / STOP / BORDERLINE \\
+\bottomrule
+\end{tabularx}
+\caption{Reuse. B3 on any question set is recomputed from the frozen $D$ and its dev-tuned threshold.}
+\end{table}
+
+%======================================================================
+\section{Data}\label{sec:data}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lrLL@{}}
+\toprule
+Set & Size & Content & Role \\
+\midrule
+Pool & 3,000 & SQ2 pool & Train $R$ (needs new $A_2$ generations) \\
+Tuning & 1,600 & VES/ECS dev (600) + fresh dev (1,000) & Tune $\tau_1, \tau_2, \tau_3, \tau_p$ and choose the
+  comparator for $\Delta_{\mathrm{mech}}$ \\
+Replay & 2,000 & VES/ECS test & Diagnostic only; not confirmatory, because RRA was designed after seeing aggregate
+  results on it \\
+Fresh test & 4,000 & New questions & \textbf{Confirmatory; all verdicts use it} \\
+\bottomrule
+\end{tabularx}
+\caption{Question sets.}
+\end{table}
+
+\paragraph{Fresh dev and test questions.}
+\begin{itemize}
+  \item \textbf{Exclude} the pool, the extension (\texttt{pilot\_qids.json}), VES/ECS dev and test, and the
+        earlier-study exclusion lists.
+  \item \textbf{TriviaQA} (\texttt{rc.nocontext}, validation): 700 dev and 2,800 test.
+  \item \textbf{PopQA}: the 8 SQ2 relations are used up, so draw from 6 other single-entity relations:
+        occupation, director, producer, screenwriter, composer and author. Use 50 dev and 200 test per relation.
+  \item \textbf{Isolation}: no PopQA subject, and no unordered \{subject, object\} pair, shared with any other
+        set. Drop exact duplicate question texts. Assert all of this in code.
+\end{itemize}
+The PopQA relations differ from the pool's; report results by source. Both models answer the same questions.
+
+%======================================================================
+\section{Arms}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}llL@{}}
+\toprule
+ID & Arm & Rule (all thresholds tuned on the tuning set) \\
+\midrule
+B0 & Greedy & Output $A_1$ \\
+B3 & Detector gate & $A_1$ if $s_1 \ge \tau_1$, else \IDK. \textbf{Primary bar.} \\
+R-all & Retry every flagged answer & $A_1$ if $s_1 \ge \tau_1$, else $A_2$ (or \IDK{} if null) \\
+R-band & Band routing (detector only) & $A_1$ if $s_1 \ge \tau_1$; $A_2$ if $\tau_b \le s_1 < \tau_1$; else \IDK.
+  Tests whether $R$ adds anything beyond $D$. \\
+R-check & Candidate checking (= B7, one round) & $A_1$ if $s_1 \ge \tau_1$; else $A_2$ if $D(A_2) \ge \tau_3$;
+  else \IDK. The VES-style route. \\
+RRA & \textbf{Ours} & Section~\ref{sec:rule} \\
+RRA-EU, RRA+check & Variants & Section~\ref{sec:variants} \\
+Oracle & Ceiling, not a method & $A_1$ if right; else $A_2$ if right; else \IDK \\
+RRA-peer & Exploratory & Section~\ref{sec:variants} \\
+\bottomrule
+\end{tabularx}
+\caption{Arms. Every arm uses the same stored $A_1$ and $A_2$ per question.}
+\end{table}
+
+%======================================================================
+\section{Metrics and statistics}
+%======================================================================
+
+\paragraph{Per arm, model and set:} right, wrong and \IDK{} per 100 questions; $U_1$ (primary) and $U_3$,
+where $U_\lambda = 100(R - \lambda W)/N$; retry rate; \textbf{routed precision} (share of routed retries that
+are right: above $\lambda/(1+\lambda)$, i.e.\ 50\% at $\lambda=1$, retries add utility); mean FPE.
+
+\paragraph{Contrasts on the fresh test, $\lambda = 1$:}
+\begin{align*}
+H &= U_1(\mathrm{Oracle}) - U_1(\text{Oracle without switching})
+   \quad \text{(switching headroom)},\\
+\Delta_{\mathrm{main}} &= U_1(\mathrm{RRA}) - U_1(\mathrm{B3}),\\
+\Delta_{\mathrm{mech}} &= U_1(\mathrm{RRA}) - U_1(C),
+\end{align*}
+where $C$ is whichever of R-band and R-check scores higher on the tuning set (chosen before the fresh test).
+
+\paragraph{Probe diagnostics} (flagged answered questions, i.e.\ $s_1 < \tau_1$): AUROC for predicting a
+successful retry from $s_2$, from $D(A_2)$, and from $-s_1$. Also report $R$'s cross-fitted pool AUROC, its
+selected depth and moment, and its calibration curve.
+
+\paragraph{Uncertainty.} Paired bootstrap over fresh test questions, 2,000 resamples, both models' rows moving
+together; 95\% percentile intervals. Pooled values are the mean of the two models.
+
+\paragraph{Strata.} TriviaQA vs PopQA; confident errors (optional stage E2); questions where the two models
+disagree (from $A_1$ correctness).
+
+%======================================================================
+\section{Decision rules}\label{sec:rules}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Verdict & Condition (pooled, fresh test) \\
+\midrule
+INSUFFICIENT\_DATA & For either model, fewer than 150 fresh-test questions where $A_1$ is wrong and $A_2$ is
+  right. \\
+STOP & CI upper bound of $H < 2.0$ (nothing to recover), \textbf{or} CI upper bound of
+  $\Delta_{\mathrm{main}} < 1.0$, \textbf{or} CI upper bound of $\Delta_{\mathrm{mech}} < 0$. \\
+GO & $\Delta_{\mathrm{main}} \ge 1.0$ with CI lower bound $> 0$, \textbf{and} $\Delta_{\mathrm{mech}} \ge 0.5$
+  with CI lower bound $> 0$. \\
+BORDERLINE & Otherwise. Add a note if $\Delta_{\mathrm{main}}$ passes but $\Delta_{\mathrm{mech}}$ does not:
+  the gain then comes from simpler routing, not from the recoverability probe. \\
+\bottomrule
+\end{tabularx}
+\caption{RRA decision rule. Units: 1.0 point of $U_1$ is one more (right $-$ wrong) answer per 100 questions.}
+\end{table}
+
+%======================================================================
+\section{Integrity checks (must pass before the fresh-test phase)}\label{sec:checks}
+%======================================================================
+\begin{enumerate}
+  \item \textbf{Isolation} of all fresh questions (Section~\ref{sec:data}).
+  \item \textbf{Frozen $D$}: on the replay set, recomputed $s_1$ matches the stored scores (max absolute difference
+        $< 10^{-3}$), and B3 reproduces 39.0.
+  \item \textbf{State reproduction, both models}: teacher-forcing 50 stored pool answers reproduces the stored
+        states (max absolute difference $< 10^{-2}$). Last run this check was skipped for Llama after a GPU memory
+        error; it must now run (see the failure policy below).
+  \item \textbf{Fallback reproduction}: regenerating $A_2$ for 50 replay questions matches the stored B7 round-1
+        output. If more than 2\% differ, use stored $A_2$ for replay and regenerated $A_2$ elsewhere, and report
+        the rate.
+  \item \textbf{Pairing}: every arm uses the same stored $A_1$ and $A_2$ for a question; neither is regenerated.
+  \item \textbf{Shuffled labels}: $R$ trained on shuffled pool labels gives cross-fitted AUROC in $[0.45, 0.55]$.
+  \item \textbf{Verdict code}: synthetic inputs must produce each of the four verdicts.
+  \item \textbf{Budget guard}: a unit test feeds synthetic stage timings and checks that no cut happens when
+        the measured projection is under 10.5 hours.
+  \item \textbf{Freeze}: the fresh-test phase refuses to start without \texttt{frozen\_config.json} (thresholds,
+        probe weights, comparator choice); log its SHA-256.
+\end{enumerate}
+\textbf{Failure policy}: on a GPU memory error, retry the check with half the batch size, up to 3 times. If it
+still fails, stop the run and report. Never skip a check.
+
+%======================================================================
+\section{Run plan and 12-hour budget on the GB10}\label{sec:budget}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lLrr@{}}
+\toprule
+Phase & Work & Per model (min) & Total (min) \\
+\midrule
+A & Environment, artifact loading, question sets, isolation asserts, unit tests, timing probe & -- & 30 \\
+B & Pool: generate $A_2$ for answered questions, grade; fit $R$ (cross-fitted + full); shuffled check; Platt
+    fits & 15 & 30 \\
+C & Fresh dev: $A_1$ + clean states, $A_2$, clean $D(A_2)$, grading & 12 & 24 \\
+D & Tuning (offline); choose comparator $C$; replay on VES/ECS test (offline); freeze & -- & 15 \\
+E & Fresh test (4,000): $A_1$ + clean states, $A_2$, clean $D(A_2)$, grading & 35 & 70 \\
+F & Bootstrap, verdict, report, audit file & -- & 30 \\
+\midrule
+ & \textbf{Required total} & & \textbf{199 ($\approx$ 3.3 h)} \\
+\midrule
+E2 (optional) & Tries 1--10 on the fresh test for the confident-error stratum & 30 & 60 \\
+G (optional) & Generality: Gemma-2-9B-it end to end (pool $A_1$/states/$A_2$, fit $D$ and $R$, fresh dev and
+               test). Reported separately; not part of the verdict. & -- & 120 \\
+\bottomrule
+\end{tabularx}
+\caption{Budget. Optional stages run only after phase F has written the verdict.}
+\end{table}
+
+\paragraph{Budget guard (fixed).}
+\begin{enumerate}
+  \item The projection uses only \emph{measured} rates: the timing probe in phase A, then actual per-item rates
+        from completed stages. Planning estimates are never used for cuts.
+  \item Only optional stages (E2, G) can be cut, and only if the measured projection exceeds 10.5 hours.
+  \item Every cut is logged with the projection and the rates behind it.
+  \item Hard stop at 11.5 hours: write whatever is complete and mark missing parts in the report.
+\end{enumerate}
+
+%======================================================================
+\section{Implementation notes for Claude Code}
+%======================================================================
+
+\paragraph{Environment.} As in the VES/ECS run: NVIDIA PyTorch container for the GB10, bf16, SDPA attention,
+pinned and logged versions. For Gemma-2 (optional), use \texttt{attn\_implementation="eager"} so that its
+attention soft-capping is applied.
+
+\paragraph{Artifacts.} Load the frozen $D$, the pool artifacts and the VES/ECS dev and test records from the
+previous run directory. Do not refit $D$. On the replay and VES/ECS dev sets, take $A_2$ from the stored B7
+round-1 record.
+
+\paragraph{Probe $R$.} Reuse the SQ2 probe code with label $y_2$. The diagnostic AUROC is cross-fitted with the
+SQ2 folds; the deployed $R$ is fitted on the whole pool. Platt scaling for RRA-EU is fitted on the cross-fitted
+pool scores, never on in-sample scores.
+
+\paragraph{Null-fallback check.} Normalise $A_1$ and $A_2$ with the grader's normaliser. $A_2$ is null if it is
+\IDK, garbled or hedged, if the two are equal, or if one contains the other as whole words.
+
+\paragraph{Offline evaluation.} Store $A_1$, $A_2$, both labels, $s_1$, $s_2$ and $D(A_2)$ for every question.
+Every arm and threshold is then evaluated offline from these records.
+
+\paragraph{Layout.}
+\begin{verbatim}
+configs/config.yaml, configs/frozen_config.json
+runs/<model>/{pool,dev_fresh,test_fresh}/   # per-question JSONL + state arrays
+results/summary.json, results/verdicts.json, results/results_report.tex
+audit/human_check_<model>.csv               # 100 routed retries per model
+logs/timing.jsonl                           # measured rates, projections, any cuts
+\end{verbatim}
+
+%======================================================================
+\section{Results report to produce}
+%======================================================================
+Write \texttt{results\_report.tex} in the SQ2 report's structure:
+\begin{itemize}
+  \item an abstract with the verdict;
+  \item setup as built: composition, $R$'s selected depth and moment, thresholds;
+  \item the main table: each arm $\times$ model with right, wrong and \IDK{} per 100, $U_1$, $U_3$, retry rate,
+        routed precision and FPE;
+  \item contrasts $H$, $\Delta_{\mathrm{main}}$ and $\Delta_{\mathrm{mech}}$ with CIs;
+  \item probe diagnostics, strata, the replay results (marked diagnostic) and the integrity-check results;
+  \item optional stages if run, and limitations.
+\end{itemize}
+
+\appendix
+\section{Grids}
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Item & Grid \\
+\midrule
+$\tau_1, \tau_2, \tau_3, \tau_b, \tau_p$ & Tuning-set quantiles of the relevant score at 5\% steps, plus $\pm\infty$;
+  pairs searched jointly (offline) \\
+$R$ & SQ2 grid: 5 depths $\times$ \{before, after, both\} $\times$ ridge strength 0.001 to 100 \\
+$\lambda$ & 1 (primary), 3 (sensitivity); thresholds re-tuned for each \\
+Seeds & Global seed 0 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Per-question record (JSONL)}
+\begin{verbatim}
+qid, source, relation, subj_id, obj_id, set, model,
+A1: {text, label_strict, is_idk, s1, first_token},
+A2: {text, label_strict, null_reason, D_score},
+s2, peer: {A1_text, A1_label, s1_peer}
+\end{verbatim}
+
+\end{document}
