@@ -1,0 +1,120 @@
+# VES / ECS experiment (ves-ces-experiment.tex): every grid, seed, path and budget figure in one place.
+# Code: vesecs/. Anything not set here is taken unchanged from the SQ2 pilot code (pilot/, model_utils.py,
+# scoring.py, steering.py). Paths are relative to the repository root.
+
+seed: 0                                   # global seed (Appendix A)
+
+paths:
+  # The SQ2 pilot run whose pool (answers, labels, folds, hidden states, tries) is the training data.
+  # On the GB10 this is outputs_pilot/run_20261110T010318Z; env VES_SQ2_RUN_DIR overrides.
+  sq2_run_dir: outputs_pilot/run_20261110T010318Z
+  out_root: outputs_ves                   # each run writes outputs_ves/run_<UTC>/ (env VES_OUT_DIR overrides)
+  popqa_ids_file: ves_popqa_ids.jsonl     # in data_cache/: PopQA id columns (vesecs.setup_data)
+
+models: [llama31_8b_instruct, qwen25_7b_instruct]   # specs and pinned revisions: pilot/config.py
+
+depths:
+  record: [0.25, 0.40, 0.50, 0.60, 0.75]  # SQ2's stored depths
+  extra: [0.90]                           # ECS fallback b only
+
+data:
+  popqa_relations: [place of birth, country, capital, capital of, sport, religion, father, mother]
+  popqa_dev_frac: 0.25
+  popqa_dev_cap: 200
+  popqa_test_cap: 600
+  dev_size: 600                           # PopQA + TriviaQA
+  test_size: 2000
+  shuffle_seed: 0
+
+decoding:
+  max_new_tokens: 16
+  batch_size: 64                          # greedy, steered, forced-first-token and teacher-forced passes
+  n_tries: 18
+  n_select_tries: 10                      # tries 1-10 define strata; 11-18 are B5 proposals / R1-R3 inputs
+  tries_prompts_per_batch: 32             # x 18 tries = 576 sequences per sampling batch (as SQ2)
+  backward_batch: 16
+  echo_batch_questions: 8                 # questions per echo pass (each with up to 4 slots x 7 variants)
+
+ves:
+  K: 3
+  steer_depths: [0.50, 0.60]
+  alphas: [0.1, 0.2, 0.4]
+  n_ubar: 1000                            # answered pool questions for the generic pull direction
+  shrunk_grid: {steer_depths: [0.50], alphas: [0.2, 0.4]}   # budget cut 4
+
+ves_free:
+  alphas: [0.1, 0.2, 0.4]
+
+ecs:
+  lens_depths: [0.50, 0.60, 0.75]
+  agreement_min: 0.80
+  betas: [0.5, 1.0, 2.0]
+  k: 3
+  n_placebo_tokens: 1000
+
+b5:
+  N_report: [1, 2, 4, 8]
+  N_max: 8
+
+thresholds:
+  quantile_step: 0.05                     # dev quantiles at 5% steps, plus -inf and +inf
+
+lambdas: [1, 3]                           # U_1 primary, U_3 sensitivity
+
+fpe: {generation: 1.0, scoring: 0.5, backward: 2.0}
+fpe_fixed: {B0: 1.0, B1: 1.5, B3: 1.0, B3b: 1.0, ECS: 1.0, R1: 9.0, R2: 9.0, R3: 9.0}
+
+stats:
+  n_boot: 2000
+  boot_seed: 7                            # SQ2's bootstrap seed
+  min_valid_frac: 0.95                    # as SQ2: otherwise a CI is undefined
+
+rules:
+  ves: {min_rejected_wrong: 150, go_delta: 1.0}
+  ecs: {min_wrong: 150, g_go: 0.5, g_stop: 0.25, go_delta: 0.5, min_auroc_gap: 0.02}
+
+strata:
+  confident_error_min_match: 8            # A1 wrong and >= 8 of tries 1-10 match A1
+  disagree_hi: 8                          # SQ2 definition: one model right >= 8/10, the other <= 2/10
+  disagree_lo: 2
+
+checks:
+  zero_steer_n: 50
+  hook_reset_tol: 0.01
+  grad_n_questions: 3
+  grad_eps_rel: 0.01                      # epsilon = 0.01 * rho
+  grad_tol: 0.10
+  shuffled_range: [0.45, 0.55]
+  echo_equivalence_n: 8                   # questions for the KV-cache echo vs. full-forward echo check
+  echo_equivalence_min_cos: 0.99
+  state_verify_n: 64                      # pool states recomputed and compared with SQ2's stored states
+
+reference_rows: true                      # R1-R3 (optional; budget cut 2 drops them)
+
+audit_n: 100
+
+budget:
+  project_limit_hours: 10.5
+  overrun_factor: 1.5
+  hard_stop_hours: 11.5
+  timing_probe_n: 256
+  cuts: [vllm_tries, drop_reference_rows, drop_placebos, shrink_ves_grid, shrink_test]
+  shrink_test_to: 1500
+  cpu_seconds: {pool_detectors: 420, echo_detectors: 240, dev_tuning: 120, analysis: 600}
+  vllm_gpu_memory_utilization: 0.40
+
+# CPU smoke test (VES_SMOKE=1, vesecs/smoke_test.py): tiny models, tiny splits. Numbers mean nothing.
+smoke_overrides:
+  data: {popqa_dev_cap: 12, popqa_test_cap: 16, dev_size: 30, test_size: 40}
+  decoding: {max_new_tokens: 8, batch_size: 16, tries_prompts_per_batch: 8, backward_batch: 8, echo_batch_questions: 4}
+  ves: {n_ubar: 16}
+  ecs: {n_placebo_tokens: 50}
+  stats: {n_boot: 200}
+  rules:
+    ves: {min_rejected_wrong: 5, go_delta: 1.0}
+    ecs: {min_wrong: 5, g_go: 0.5, g_stop: 0.25, go_delta: 0.5, min_auroc_gap: 0.02}
+  checks: {zero_steer_n: 8, state_verify_n: 8, echo_equivalence_n: 2, echo_equivalence_min_cos: 0.95,
+           shuffled_range: [0.0, 1.0]}
+  audit_n: 10
+  budget: {timing_probe_n: 16, project_limit_hours: 1000, cpu_seconds: {pool_detectors: 30, echo_detectors: 30,
+           dev_tuning: 10, analysis: 30}}   # no cuts in the smoke test: every code path runs (cuts: vesecs.tests)

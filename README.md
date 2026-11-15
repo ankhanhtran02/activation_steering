@@ -1,5 +1,9 @@
 # Activation steering for hallucination mitigation
 
+> **VES / ECS experiment (2026-11-14):** two steering methods built on the RQ's hidden-state mistake detector,
+> each with a GO / BORDERLINE / STOP verdict. Spec: [ves-ces-experiment.tex](ves-ces-experiment.tex); code and
+> instructions: [vesecs/README.md](vesecs/README.md); one command on the GPU server: `bash run_ves.sh`.
+
 > **New direction (2026-11-09, branch `pilot-confidence-rule`):** a pilot asking whether activation
 > steering does anything a confidence rule can't, in five sub-questions with go / stop signals, on
 > Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct within 12 GB10-hours. Start at

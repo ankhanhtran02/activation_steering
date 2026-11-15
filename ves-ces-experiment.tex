@@ -1,0 +1,628 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt, topsep=4pt}
+\renewcommand{\arraystretch}{1.15}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\IDK}{\textsc{idk}}
+\newcommand{\sD}{s_{D}}
+\newcommand{\note}[1]{%
+  \begin{quote}\small\color{black!75}\textit{Note.} #1\end{quote}}
+
+\title{Do VES and ECS Reduce Hallucination?\\[2pt]
+\large Methods and Experiment Design (Implementation Specification)}
+\author{Khanh Tran}
+\date{14 November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document specifies two activation-steering methods built on the SQ2 hidden-state mistake detector,
+and one experiment that decides whether each is worth a full study. \textbf{VES} (Verify-and-Exclude
+Steering) is multi-pass: when the detector rejects an answer, it steers the model away from that specific
+answer, lets it answer again, and checks the new answer on a clean run. \textbf{ECS} (Echo-Check Steering)
+is one pass: before the model commits to its first answer token, it feeds the model's mid-layer guesses back
+into a small side branch, lets a detector judge each guess, and switches to a better-judged guess. Both
+methods are built on top of the same baseline, the SQ2 detector used as an abstention gate, so the primary
+comparison isolates what the steering adds. The experiment reuses the SQ2 setup wherever possible, runs on
+one NVIDIA GB10 within 12 hours (planned: about 7 hours), and ends with a GO / BORDERLINE / STOP verdict
+for each method. The document is written so that Claude Code can implement it without further design
+decisions; where a detail is not stated, \textbf{reuse the SQ2 code unchanged}.
+\end{abstract}
+
+%======================================================================
+\section{Purpose}
+%======================================================================
+
+\paragraph{The question.} Do VES and ECS reduce hallucination \emph{beyond what the SQ2 detector already
+achieves on its own}?
+
+\paragraph{Why this framing.} The SQ2 detector can already reduce wrong answers by replacing low-scoring
+answers with ``I don't know'' (\IDK). That is baseline \textbf{B3}. Both methods are B3 plus an add-on:
+\begin{itemize}
+  \item \textbf{VES} = B3 + a search for a better answer when the draft is rejected.
+  \item \textbf{ECS} = B3 + a pre-commit switch to a better-judged first answer token.
+\end{itemize}
+So every primary contrast is \emph{method minus B3}, on the same questions with the same greedy drafts.
+Any difference comes only from the steering.
+
+\paragraph{What the experiment returns.} For each method: a verdict (Section~\ref{sec:rules}), the main
+table of right, wrong and \IDK{} answers per 100 questions, and diagnostics that explain the verdict.
+
+%======================================================================
+\section{What is reused from SQ2, and what changes}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lLL@{}}
+\toprule
+Component & SQ2 & This experiment \\
+\midrule
+Models & Llama-3.1-8B-Instruct (\texttt{unsloth} mirror, rev.\ \texttt{4699cc75}); Qwen2.5-7B-Instruct
+         (rev.\ \texttt{a09a3545}) & Same. Record SHA-256 of every weight file. \\
+Precision & bf16, frozen weights & Same \\
+Prompt & ``Answer with only the answer, or reply exactly `I don't know.'\,'' & Same text and chat template \\
+Main answer & Greedy, at most 16 new tokens & Same. The draft $A_1$ is generated once per question and
+         reused by every method. \\
+Tries & 18 at temperature 1; tries 1--10 only for selection, 11--18 only for clues & Same roles: tries
+         1--10 define strata; tries 11--18 feed the resampling baseline B5 and optional reference rows. \\
+Confidence $m$ & Teacher-forced log-prob of answer + end minus that of ``I don't know.'' + end & Same \\
+Hidden states & Residual stream at 25, 40, 50, 60, 75\% depth; before and after answering & Same, plus 90\%
+         depth (ECS fallback only) \\
+Grader & Rule-based, 4 checks & Same, plus one hedge rule (Section~\ref{sec:grader}). Primary labels use
+         the strict grader; SQ2-grader results are also reported. \\
+Detector recipe & Ridge probe; depth, moment and ridge strength chosen by leave-one-out AUROC & Same
+         recipe, fitted once on the whole pool \\
+Folds & 5 folds grouped by PopQA subject & Reused for cross-fitted diagnostics on the pool only \\
+Bootstrap & 2,000 resamples over questions; both models' rows move together & Same, applied to paired
+         differences \\
+Verdicts & INSUFFICIENT\_DATA / GO / STOP / BORDERLINE & Same vocabulary \\
+\bottomrule
+\end{tabularx}
+\caption{Reuse of the SQ2 setup.}
+\end{table}
+
+\paragraph{What changes.}
+\begin{itemize}
+  \item New dev and test questions (Section~\ref{sec:data}). The SQ2 pool becomes training data only.
+  \item Outcomes are answer-level (right, wrong, \IDK), not AUROC. AUROC is used only for ECS's
+        feasibility check.
+  \item Disagreement questions are a secondary subset, not the test set.
+  \item No cross-fitting is needed on dev or test, because detectors are fitted on the pool and dev and
+        test are new questions.
+\end{itemize}
+
+%======================================================================
+\section{Data}\label{sec:data}
+%======================================================================
+
+\subsection{Training data: the SQ2 pool}
+The 3,000 pool questions, with their saved greedy answers, labels, fold ids, hidden states and tries, are used
+\emph{only} to fit detectors and compute steering constants. They are never used to tune thresholds or to
+report results. Regrade the saved answers with the strict grader. If hidden states are missing for a needed
+depth, recompute them by teacher forcing the saved answers with the SQ2 extraction function. \textbf{Never
+regenerate pool answers.} Extension questions are not used for training; their ids are excluded below.
+
+\subsection{Dev and test questions}
+\begin{itemize}
+  \item \textbf{Exclude} every id in \texttt{pilot\_qids.json} (pool and extension) and the earlier-study
+        exclusion lists that SQ2 used (same files).
+  \item \textbf{PopQA}: same 8 relations as SQ2. Several are nearly used up (``capital of'', ``religion'',
+        ``mother''), so do not use fixed quotas. Take all remaining eligible items from the 8 relations,
+        shuffle (seed 0), assign 25\% to dev and 75\% to test, capped at 200 dev and 600 test.
+  \item \textbf{TriviaQA} (\texttt{rc.nocontext}, validation): fill each split to its target size,
+        600 dev and 2,000 test questions. Drop questions whose text exactly duplicates another used question.
+  \item \textbf{Isolation rules for PopQA}: a dev or test subject must not appear as a subject in the pool,
+        the extension or the other split. The unordered pair \{subject, object\} must also not appear there.
+        This catches ``capital'' / ``capital of'' reversals of the same fact.
+  \item Both models answer the same questions. Report the final composition by source and relation.
+\end{itemize}
+All isolation rules are asserted in code (Section~\ref{sec:checks}).
+
+%======================================================================
+\section{Shared components}
+%======================================================================
+
+\subsection{Notation}
+$L$ is the number of layers (32 for Llama, 28 for Qwen). Depth $d\%$ maps to layer $\ell(d)$ with the SQ2
+convention: Llama 25/40/50/60/75/90\% $\to$ 8/13/16/19/24/29; Qwen $\to$ 7/11/14/17/21/25. Use the SQ2
+code's indexing of hidden states unchanged. $h^{\ell}_t$ is the residual stream after block $\ell$ at
+position $t$; $T$ is the last prompt token. $t_{\IDK}$ is the first token of the model's ``I don't know.''
+reply: the most frequent first token among \IDK{} replies in the pool.
+
+\subsection{Tries}
+Per model and per dev or test question, draw 18 tries at temperature 1 with seed
+$\mathrm{hash}(\text{model}, \text{qid}, \text{try})$. Tries 1--10 define strata. Tries 11--18 are
+proposals for B5 and inputs for the optional reference rows. vLLM may be used for tries if it runs on the GB10
+with the same weights and precision; otherwise use Hugging Face batched generation.
+
+\subsection{Grader}\label{sec:grader}
+Use the SQ2 grader with one added check between ``Declined?'' and ``Contains an accepted answer?'':
+\begin{quote}
+\textbf{Hedged?} Split the normalised reply on `` or '' and ``/''. If there are at least 2 non-empty parts,
+each of at most 6 words, and the parts do not all match the same alias set $\rightarrow$ \emph{hedged},
+counted as wrong.
+\end{quote}
+Report how many labels change relative to the SQ2 grader. The syntactic checks (garbled, declined, hedged)
+use no gold answers, so methods may use them to discard candidates.
+
+\subsection{Clean scoring and detectors}
+\texttt{score(q, A)} runs an \emph{unsteered} teacher-forced pass over prompt $\oplus A \oplus$ end and
+returns the before state (last prompt token) and after state (last answer token) at every stored depth, exactly
+as in SQ2. ``Clean'' always means unsteered, even when $A$ came from a steered run.
+
+Fit three detectors per model on all answered pool questions (strict labels):
+\begin{itemize}
+  \item $D$: the SQ2 recipe unchanged (it selects depth, moment and ridge strength). SQ2 found Llama
+        75\%/both and Qwen 60\%/both; freeze whatever it selects. $\sD(q, A)$ is its output.
+  \item $D_{\mathrm{before}}$: same recipe, moment restricted to before.
+  \item $D_{\mathrm{after}}$: same recipe, moment restricted to after.
+\end{itemize}
+Report each detector's cross-fitted pool AUROC with the SQ2 folds; it should match SQ2's numbers.
+
+\subsection{Outcome and compute measures}
+For $N$ test questions with $R$ right and $W$ wrong answers (garbled and hedged count as wrong; \IDK{} counts
+as neither):
+\[
+U_\lambda = 100 \cdot \frac{R - \lambda W}{N}, \qquad \lambda = 1 \text{ (primary)}, \;\lambda = 3 \text{ (sensitivity)}.
+\]
+Compute is counted in forward-pass equivalents (FPE): one generation (prefill + up to 16 decode steps) = 1.0;
+one clean scoring pass = 0.5; one backward pass (including its forward) = 2.0. Also log wall-clock time per stage.
+
+%======================================================================
+\section{Method 1: Verify-and-Exclude Steering (VES)}
+%======================================================================
+
+\paragraph{In plain terms.} The model answers. The detector checks the answer. If it fails, VES finds the
+internal direction that pushes the model toward \emph{that specific} answer, pushes against it, and lets the
+model answer again. The new answer is checked on a clean, unsteered run, so the steering cannot fool the
+detector. After up to 3 rounds, the model gives the first answer that passes, or says \IDK.
+
+\subsection{Common search loop (shared with baselines B5 and B7)}\label{sec:loop}
+Inputs: question $q$, draft $A_1$, threshold $\tau$, rounds $K$, proposal mechanism $P$.
+\begin{enumerate}
+  \item If $A_1$ is \IDK, output \IDK{} (no search).
+  \item If $\sD(q, A_1) \ge \tau$, output $A_1$.
+  \item Set the rejected set $\mathcal{R} \leftarrow \{A_1\}$.
+  \item For $k = 1, \dots, K$:
+  \begin{enumerate}
+    \item $A_k' \leftarrow P(q, \mathcal{R})$.
+    \item If $A_k'$ is \IDK, garbled or hedged, or matches (after normalisation) an answer in $\mathcal{R}$:
+          record it. VES and B7 then stop the loop, because they are deterministic and would repeat the
+          result. B5 skips to its next try.
+    \item Otherwise compute $\sD(q, A_k')$ on a clean run. If $\ge \tau$, output $A_k'$ and stop.
+    \item Otherwise add $A_k'$ to $\mathcal{R}$.
+  \end{enumerate}
+  \item Output \IDK.
+\end{enumerate}
+
+\note{\textbf{Offline replay.} To tune $\tau$ without re-running, run the loop for every answered draft with
+step 4(c)'s acceptance disabled, and record each candidate and its clean score. For any $\tau$, replaying the
+records and stopping at the first accepted candidate reproduces the method exactly: proposal $k$ depends only
+on the earlier candidates, and in the replay those are exactly the rejected ones.}
+
+\subsection{The VES proposal \texorpdfstring{$P_{\mathrm{VES}}(q, \mathcal{R})$}{P\_VES(q, R)}}
+\begin{enumerate}
+  \item \textbf{Pull vector}, once per rejected answer $A \in \mathcal{R}$. Add a zero vector $\delta$
+        (requires grad) to $h^{\ell_s}_T$. Run an unsteered teacher-forced pass on
+        prompt $\oplus A \oplus$ end. Let $\mathcal{L}$ be the sum of the log-probabilities of the answer
+        tokens and the end token. Then $g_A = \partial \mathcal{L} / \partial \delta$.
+  \item \textbf{Remove the generic part.} Let $\hat g = g_A / \lVert g_A \rVert$ and
+        $u_A = \hat g - (\hat g \cdot \bar u)\,\bar u$, then normalise $u_A$. Here $\bar u$ is the
+        normalised mean of $\hat g$ over 1,000 answered pool questions (their saved answers, seed 0). The
+        generic part mostly encodes ``answer confidently''; removing it keeps only what is specific to $A$.
+  \item \textbf{Combine.} Orthonormalise the $u_A$ of all rejected answers in rejection order (Gram--Schmidt)
+        to get $w_1, \dots, w_{|\mathcal{R}|}$.
+  \item \textbf{Steered answer.} Add $v = -\alpha\,\rho \sum_j w_j$ to $h^{\ell_s}$ at the last prompt
+        position and at every generated position. Decode greedily, at most 16 tokens, same prompt. Here
+        $\rho$ is the median of $\lVert h^{\ell_s}_T \rVert$ over pool questions.
+\end{enumerate}
+
+\subsection{Variants and ablations}\label{sec:vesabl}
+\begin{itemize}
+  \item \textbf{VES-free} (cheaper, no backward pass): $u_A$ is the normalised
+        $h^{\ell_s}_{\mathrm{after}}(A) - \mu$, where $\mu$ is the mean after-state at $\ell_s$ over answered
+        pool questions. Steps 3--4 are unchanged. Tune $\alpha$ separately on dev at the chosen $\ell_s$.
+  \item \textbf{VES-placebo}: $u_A$ comes from a different, randomly chosen answered pool question
+        (seeded mapping), processed through steps 1--2. This tests whether the push must be specific to
+        the rejected answer.
+  \item \textbf{VES-unclean} (no extra cost): also record $\sD$ computed from the steered run's own states.
+        Replaying with these scores shows how much the steering would fool the detector without clean
+        re-scoring.
+\end{itemize}
+
+\subsection{Hyperparameters (chosen on dev)}
+$\ell_s \in \{50\%, 60\%\}$ depth; $\alpha \in \{0.1, 0.2, 0.4\}$; $K = 3$ (fixed); $\tau$ from the
+threshold grid (Appendix~\ref{app:grids}). Choose by dev $U_1$ (and separately for $U_3$). VES-placebo uses
+VES's chosen $\ell_s$ and $\alpha$.
+
+%======================================================================
+\section{Method 2: Echo-Check Steering (ECS)}
+%======================================================================
+
+\paragraph{In plain terms.} SQ2 found that the model judges its answer best \emph{after} writing it. ECS
+moves that check to \emph{before} the answer is written, within the same pass. Halfway through the
+computation, it reads the model's top guesses for the first answer token and feeds each one into a small side
+branch, as if the model had just said it. A few layers later, a detector judges each guess. The remaining
+layers then keep the guess, or switch to a better-judged one. After the answer is written, the usual detector
+gate can still replace it with \IDK; this is still one pass.
+
+\subsection{The one-pass algorithm (what a deployment would run)}
+At the step that produces the first answer token:
+\begin{enumerate}
+  \item Run blocks $1, \dots, a$ normally.
+  \item \textbf{Guess.} Apply the logit lens to $h^a_T$: logits $= W_U \cdot \mathrm{norm}_{\mathrm{final}}(h^a_T)$.
+        Let $\mathrm{top}_a$ be the top token over the full vocabulary. The candidate set $C$ is the top 3
+        tokens after excluding special tokens, tokens with no alphanumeric character, and $t_{\IDK}$.
+        Let $c_1$ be the first of them.
+  \item \textbf{Echo.} For each $c \in C$, add a side row at position $T{+}1$ whose state after block $a$ is
+        $h^a_T + \beta\,\rho_a\,\hat e_c$, with $\hat e_c = W_E[c] / \lVert W_E[c] \rVert$ (input embedding)
+        and $\rho_a$ the median of $\lVert h^a_T \rVert$ over the pool. Side rows pass through blocks
+        $a{+}1, \dots, b$, attending to the prompt's keys and values.
+  \item \textbf{Check.} $E(c)$ = echo detector applied to the side row's state after block $b$.
+  \item \textbf{Decide.}
+  \begin{itemize}
+    \item Presumed output $p = t_{\IDK}$ if $\mathrm{top}_a = t_{\IDK}$, else $p = c_1$.
+    \item If $p \ne t_{\IDK}$ and $E(c_1) \ge \tau_{\mathrm{keep}}$: \textbf{keep} (no intervention).
+    \item Otherwise let $c^* = \arg\max_{c \in C} E(c)$. If $E(c^*) \ge \tau_{\mathrm{sw}}$:
+          \textbf{switch} to $c^*$. Otherwise keep.
+  \end{itemize}
+  \item \textbf{Steer.} On a switch, push the main row's final residual along $W_U[c^*] - W_U[p]$ until
+        $c^*$ is the top token (equivalently, a logit bias). Then continue greedy decoding.
+  \item \textbf{After-gate.} When the answer ends, if it is not \IDK{} and $\sD < \tau_D$, replace it with \IDK.
+\end{enumerate}
+
+\subsection{How this experiment simulates it}
+The main row's computation up to block $b$ does not depend on the side rows: they sit at a later position, and
+attention is causal. The fused algorithm can therefore be reproduced \emph{exactly} with separate calls:
+\begin{enumerate}
+  \item A prompt forward pass with the logit lens at layer $a$ gives $C$ and $\mathrm{top}_a$.
+  \item For each $c \in C \cup \{f(A_1)\}$, where $f(A_1)$ is the first token of the draft, run a forward
+        pass on prompt $\oplus c$. A hook on the output of block $a$ overwrites position $T{+}1$ with
+        $h^a_T + \beta\rho_a\hat e_c$ (position $T$ is in the same tensor). Read $h^b_{T+1}$.
+  \item \textbf{Keep} $\rightarrow$ output $A_1$, which is identical to the fused main row's output.
+        \textbf{Switch} $\rightarrow$ output $\mathrm{completion}(q, c^*)$: greedy decoding with the first
+        answer token forced to $c^*$, at most 15 more tokens. If $c^* = f(A_1)$, use $A_1$.
+\end{enumerate}
+Outputs are identical to the fused implementation. Latency is \emph{not} measured; report the compute overhead
+analytically. Extra FLOPs are about $k(b-a)/L$ of one token's forward pass, or about $k(b-a)/(L(P+n))$ of the
+whole generation for $P$ prompt and $n$ answer tokens, with $k = 3$. ECS counts as 1 FPE.
+
+\subsection{Echo variants}\label{sec:ecsabl}
+\begin{itemize}
+  \item \textbf{ECS-1P} (main): as above.
+  \item \textbf{ECS-exact} (upper bound, not one pass): no hook. The side row is the candidate token processed
+        through all blocks, i.e.\ the real state after the candidate token. This shows how good the verdict
+        would be with a perfect echo.
+  \item \textbf{ECS-placebo}: echo a random token from a fixed list of 1,000 frequent alphabetic tokens
+        (seeded per question and slot) instead of $c$, with its own echo detector trained on placebo rows and
+        the real candidate's label. If it matches ECS-1P, the verdict is just reading the main state.
+\end{itemize}
+
+\subsection{Echo detector \texorpdfstring{$E$}{E} (one per variant per model)}
+A ridge probe on $h^b_{T+1}$ (one vector), with ridge strength chosen by leave-one-out AUROC over the SQ2 grid.
+Rows are pool questions $\times$ $(C \cup \{f(A_1)\})$, deduplicated. Label $y(q, c)$ is the strict label of
+$\mathrm{completion}(q, c)$; for $c = f(A_1)$ it is $A_1$'s label. \IDK{} or garbled completions get label 0.
+Fit on the full pool for use on dev and test. For the diagnostic cross-fitted pool AUROC, put all rows of a
+question in its SQ2 fold.
+
+\subsection{Hyperparameters}
+\begin{itemize}
+  \item $a$: the smallest depth in $\{50\%, 60\%, 75\%\}$ whose pool agreement
+        $\Pr[\mathrm{top}_a = f(A_1)] \ge 0.80$; if none qualifies, $a = 75\%$.
+        $b = 75\%$ if $a < 75\%$, otherwise $b = 90\%$.
+  \item $\beta \in \{0.5, 1, 2\}$: chosen by dev AUROC of $E_{\mathrm{1P}}(f(A_1))$ for $A_1$'s correctness.
+  \item $(\tau_{\mathrm{keep}}, \tau_{\mathrm{sw}}, \tau_D)$: tuned jointly on dev for $U_\lambda$
+        (Appendix~\ref{app:grids}). Precompute every candidate's completion, grade and $\sD$, so that all
+        threshold combinations are evaluated offline.
+\end{itemize}
+
+%======================================================================
+\section{Baselines and ablations}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}llcL@{}}
+\toprule
+ID & Name & FPE & What it does / role \\
+\midrule
+B0 & Greedy & 1 & $A_1$ as is (the model may say \IDK{} itself). Reference. \\
+B1 & Confidence gate & 1.5 & $A_1$ if $m \ge \tau$, else \IDK. Reference. \\
+B3 & Detector gate & 1 & $A_1$ if $\sD(q, A_1) \ge \tau$, else \IDK. \textbf{Primary bar for both methods.} \\
+B3b & Before-only gate & 1 & As B3 with $D_{\mathrm{before}}$. Reference for ECS. \\
+B5 & Detector-checked resampling & varies & The search loop with proposals = tries 11, 12, \dots{}
+     (at most $N$). Report $N \in \{1, 2, 4, 8\}$ and $N_{\mathrm{matched}}$, the smallest $N$ whose mean
+     dev FPE is at least VES's. \textbf{VES comparator}: same loop, random proposals. \\
+B7 & Token-ban search & varies & The search loop with proposals = greedy decoding with the first token of every
+     rejected answer banned at the first answer step. \textbf{VES comparator}: output-level exclusion. \\
+\midrule
+-- & VES-free, VES-placebo, VES-unclean & & VES ablations (Section~\ref{sec:vesabl}) \\
+-- & ECS-exact, ECS-placebo & & ECS ablations (Section~\ref{sec:ecsabl}). ECS without switching equals B3. \\
+\midrule
+R1 & Judge A gate (optional) & 9 & SQ2's 5 outside clues, fitted on the pool. Reference only. \\
+R2 & Judge B gate (optional) & 9 & Outside clues + $D$, fitted on the pool. Reference only. \\
+R3 & Majority vote (optional) & 9 & Most common answer among tries 11--18. Reference only. \\
+\bottomrule
+\end{tabularx}
+\caption{Baselines and ablations. Every thresholded method uses its own dev-tuned threshold(s).}
+\end{table}
+
+%======================================================================
+\section{Metrics and statistics}
+%======================================================================
+
+\paragraph{Per method, model and split:} right, wrong and \IDK{} per 100 questions; $U_1$; $U_3$; mean FPE.
+
+\paragraph{Primary contrasts (test, $\lambda = 1$):}
+\begin{align*}
+\Delta_{\mathrm{VES}} &= U_1(\mathrm{VES}) - U_1(\mathrm{B3}), \\
+\Delta_{\mathrm{VES,B5}} &= U_1(\mathrm{VES}) - U_1(\mathrm{B5}@N_{\mathrm{matched}}), \\
+\Delta_{\mathrm{ECS}} &= U_1(\mathrm{ECS\text{-}1P}) - U_1(\mathrm{B3}).
+\end{align*}
+
+\paragraph{ECS feasibility (gap closure).} On answered test drafts, compute the AUROC for $A_1$'s correctness
+of $D_{\mathrm{before}}$ ($A_{\mathrm{bef}}$), $D_{\mathrm{after}}$ ($A_{\mathrm{aft}}$) and
+$E_{\mathrm{1P}}$ applied to the echo of $f(A_1)$ ($A_{\mathrm{echo}}$). Then
+\[
+G = \frac{A_{\mathrm{echo}} - A_{\mathrm{bef}}}{A_{\mathrm{aft}} - A_{\mathrm{bef}}}.
+\]
+If $A_{\mathrm{aft}} - A_{\mathrm{bef}} < 0.02$ for a model, $G$ is undefined for that model. Report the same
+quantity for ECS-exact and ECS-placebo.
+
+\paragraph{Pooling and uncertainty.} Pooled values are the mean of the two models' values. 95\% CIs come from a
+paired bootstrap: 2,000 resamples of test question ids, both models' rows moving together, percentile interval.
+Detectors and thresholds are fixed, so the CI covers question sampling, which is the relevant uncertainty for a
+fitted method.
+
+\paragraph{Strata.} All test questions (primary); confident errors ($A_1$ wrong and at least 8 of tries 1--10
+match $A_1$); disagreement questions (SQ2 definition, across the two models); TriviaQA vs PopQA.
+
+\paragraph{Diagnostics.}
+\begin{itemize}
+  \item \textbf{Hit rate}: among wrong answered drafts, the share where any of the first $K$ proposals is
+        correct. Report for VES, VES-free, VES-placebo, B7, B5 (first 3 tries) and B5 (8 tries), overall and on
+        confident errors.
+  \item \textbf{Distinct rate}: the share of rounds producing a new, non-\IDK, non-garbled answer.
+  \item \textbf{Fooling}: mean of (steered $\sD$ $-$ clean $\sD$) for VES candidates, and VES-unclean's
+        $U_1$.
+  \item \textbf{ECS}: the agreement rate $\Pr[\mathrm{top}_a = f(A_1)]$; the AUROCs above; the number of
+        switches; switches from wrong to right and from right to wrong, and the net.
+  \item \textbf{Net fixes} for every method versus B3: (wrong or \IDK{} $\to$ right) minus
+        (right $\to$ wrong or \IDK).
+  \item Risk--coverage curves from sweeping thresholds on test: descriptive only, not used for verdicts.
+\end{itemize}
+
+%======================================================================
+\section{Decision rules}\label{sec:rules}
+%======================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Verdict & Condition (VES) \\
+\midrule
+INSUFFICIENT\_DATA & For either model, fewer than 150 test drafts are answered, wrong and rejected at the
+                     frozen $\tau$. \\
+GO & $\Delta_{\mathrm{VES}} \ge 1.0$ with CI lower bound $> 0$, \textbf{and}
+     $\Delta_{\mathrm{VES,B5}} \ge 0$ (point estimate). \\
+STOP & CI upper bound of $\Delta_{\mathrm{VES}} < 1.0$, \textbf{or} CI upper bound of
+       $\Delta_{\mathrm{VES,B5}} < 0$. \\
+BORDERLINE & Otherwise. \\
+\bottomrule
+\end{tabularx}
+\caption{VES decision rule. The second GO condition matters: if VES beats B3 but loses to plain resampling,
+the value comes from searching, not from steering.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Verdict & Condition (ECS) \\
+\midrule
+INSUFFICIENT\_DATA & For either model, fewer than 150 answered wrong drafts on test, or $G$ undefined. \\
+GO & $G \ge 0.5$ with CI lower bound $> 0$, \textbf{and} $\Delta_{\mathrm{ECS}} \ge 0.5$ with CI lower
+     bound $> 0$. \\
+STOP & CI upper bound of $G < 0.25$, \textbf{or} CI upper bound of $\Delta_{\mathrm{ECS}} < 0.5$. \\
+BORDERLINE & Otherwise. \\
+\bottomrule
+\end{tabularx}
+\caption{ECS decision rule. Add a note to the verdict if ECS-exact would pass GO while ECS-1P does not:
+the echo approximation, not the idea, is then the bottleneck.}
+\end{table}
+
+\noindent Units: 1.0 point of $U_1$ means one more (right $-$ wrong) answer per 100 questions. ECS's bar is
+lower because it is a one-pass, nearly free add-on.
+
+%======================================================================
+\section{Integrity checks (must pass before the test phase)}\label{sec:checks}
+%======================================================================
+\begin{enumerate}
+  \item \textbf{Isolation}: no dev or test id appears in the pool, the extension, the other split or the
+        earlier-study exclusions; no shared PopQA subject or unordered \{subject, object\} pair.
+  \item \textbf{Pairing}: every method uses the same stored $A_1$ for each question; $A_1$ is never regenerated.
+  \item \textbf{Zero steering}: VES with $\alpha = 0$ reproduces $A_1$ exactly on 50 dev questions.
+  \item \textbf{Hook reset}: after any steered call, an unsteered forward pass reproduces the stored before-state
+        (max absolute difference below $10^{-2}$ in bf16).
+  \item \textbf{Gradient}: on 3 questions, the directional derivative $g_A \cdot u$ matches the finite difference
+        $(\mathcal{L}(\epsilon u) - \mathcal{L}(0))/\epsilon$ within 10\% for a random unit $u$ and
+        $\epsilon = 10^{-2}\rho$.
+  \item \textbf{Identity echo}: an ECS hook that writes position $T{+}1$'s own state back reproduces ECS-exact.
+  \item \textbf{Shuffled labels}: $D$ and $E_{\mathrm{1P}}$ trained on shuffled pool labels give cross-fitted
+        AUROC in $[0.45, 0.55]$.
+  \item \textbf{Verdict code}: unit tests feed synthetic inputs that must produce each of the four verdicts for
+        each method.
+  \item \textbf{Freeze}: the test phase refuses to start unless \texttt{frozen\_config.json} exists; log its SHA-256.
+\end{enumerate}
+
+%======================================================================
+\section{Run plan and 12-hour budget on the GB10}
+%======================================================================
+
+Run models one after the other. Phases B--C for both models, then the freeze, then phase E for both models.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lLrr@{}}
+\toprule
+Phase & Work & Per model (min) & Total (min) \\
+\midrule
+A & Environment, artifact loading, question sets, isolation asserts, unit tests, 256-question timing probe & -- & 30 \\
+B (pool) & Verify/recompute states (10); fit $D$, $D_{\mathrm{before}}$, $D_{\mathrm{after}}$ + shuffled check (5);
+           $\bar u$ from 1,000 backward passes (5); logit lens at all depths, choose $a$ (2); candidate
+           completions (8); echo states, exact + 1P $\times$ 3 $\beta$ + placebo (8); fit $E$ variants (2) & 40 & 80 \\
+C (dev) & Drafts and states (3); 18 tries (10); clean scoring of tries (3); VES grid, 6 configs (18);
+          VES-free $\alpha$ grid (5); B7 (3); ECS candidates, echoes, completions (3); offline tuning (2) & 47 & 94 \\
+D & Freeze configs for both models & -- & 5 \\
+E (test) & Drafts and states (8); 18 tries (35 with HF, about 8 with vLLM); clean scoring of tries (8); VES,
+           VES-free, VES-placebo (25); B7 (8); ECS candidates, echoes, completions (10); offline decisions (2) & 96 & 192 \\
+F & Bootstrap, verdicts, report, audit file & -- & 25 \\
+\midrule
+ & \textbf{Planned total} & & \textbf{426 ($\approx$ 7.1 h)} \\
+\bottomrule
+\end{tabularx}
+\caption{Budget. The estimates assume Hugging Face generation at batch 64 on a memory-bandwidth-bound GB10;
+the phase A timing probe replaces them with measured rates.}
+\end{table}
+
+\paragraph{Budget guard.} After every stage, write the projected end time. If the projection exceeds 10.5 hours,
+or any stage overruns its estimate by more than 50\%, apply cuts in this order until the projection fits:
+\begin{enumerate}
+  \item Use vLLM for tries if available (no design change).
+  \item Drop optional reference rows R1--R3.
+  \item Drop VES-placebo and ECS-placebo.
+  \item Shrink the VES dev grid to $\ell_s = 50\%$, $\alpha \in \{0.2, 0.4\}$.
+  \item Reduce the test set to 1,500 questions by removing TriviaQA questions (seeded).
+\end{enumerate}
+Never cut B3, B5, B7, VES, ECS-1P, ECS-exact or the integrity checks. Hard stop at 11.5 hours: write whatever is
+complete and mark missing parts in the report.
+
+%======================================================================
+\section{Implementation notes for Claude Code}
+%======================================================================
+
+\paragraph{Environment.} The NVIDIA GB10 pairs an Arm (aarch64) Grace CPU with a Blackwell GPU sharing about
+128 GB of unified memory; decoding is limited by memory bandwidth. Use NVIDIA's PyTorch container for this
+platform, bf16, and PyTorch SDPA attention (do not depend on flash-attn). Pin and log the \texttt{torch} and
+\texttt{transformers} versions; commit a lock file.
+
+\paragraph{Batching and determinism.} Use fixed batch sizes per stage, left padding, and question-id order.
+Greedy outputs can depend on batch composition, which is why $A_1$ is generated once and reused.
+
+\paragraph{Hooks.} Register forward hooks on \texttt{model.model.layers[i]}; outputs are tuples, so modify
+element \texttt{[0]}. Use the SQ2 index convention for $i$. Helpers:
+\begin{itemize}
+  \item \texttt{add\_vector(layer, vec)}: during \texttt{generate}, add \texttt{vec} at position $-1$ in the
+        prefill call (sequence length $>1$) and at position 0 in each decode call (sequence length $=1$).
+  \item \texttt{overwrite\_last(layer, fn)}: set \texttt{out[:, -1] = fn(out[:, -2])}, for ECS echoes.
+  \item \texttt{capture(layers)}: store \texttt{out[:, pos]} for requested positions.
+\end{itemize}
+Always remove hooks in a \texttt{finally} block.
+
+\paragraph{Gradients (VES).} Set \texttt{requires\_grad=False} on all parameters and enable gradients only for
+the pull-vector pass. Keep $\delta$ in float32 and cast it when adding. Batch size 16.
+
+\paragraph{Token ban (B7).} A logits processor sets $-\infty$ on banned ids at the first generated step only.
+
+\paragraph{Forced first token (ECS).} Append $c$ to the prompt ids and generate at most 15 tokens; the completion
+is the decoded $c \oplus$ generated tokens.
+
+\paragraph{Storage.} Store states as float16 NumPy arrays, at the needed depths only. Every stage writes its
+outputs atomically and is skipped if they are already complete, so the run can resume.
+
+\paragraph{Layout.}
+\begin{verbatim}
+configs/config.yaml            # all grids, seeds, paths
+configs/frozen_config.json     # written in phase D
+runs/<model>/<split>/          # per-question records (JSONL) + state arrays
+results/summary.json           # all metrics with CIs
+results/verdicts.json          # VES and ECS verdicts + inputs to each rule
+results/results_report.tex     # report, structured like the SQ2 report
+audit/human_check_<model>.csv  # 100 outputs per model that differ from A1
+logs/timing.jsonl              # wall-clock per stage, projected end time
+\end{verbatim}
+
+%======================================================================
+\section{Results report to produce}
+%======================================================================
+Write \texttt{results\_report.tex} in the SQ2 report's structure:
+\begin{itemize}
+  \item an abstract stating both verdicts;
+  \item setup, as built (composition, chosen hyperparameters, detector selections);
+  \item the main table: each method $\times$ model with right, wrong and \IDK{} per 100, $U_1$, $U_3$ and FPE;
+  \item a contrasts table with $\Delta_{\mathrm{VES}}$, $\Delta_{\mathrm{VES,B5}}$, $\Delta_{\mathrm{ECS}}$ and $G$,
+        with CIs;
+  \item strata tables, the diagnostics, and the integrity-check results;
+  \item limitations, including grader changes and any budget cuts applied.
+\end{itemize}
+The audit file lists 100 random test outputs per model where a method's output differs from $A_1$, with the
+automatic label, for a manual check after the run.
+
+\appendix
+%======================================================================
+\section{Grids}\label{app:grids}
+%======================================================================
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lL@{}}
+\toprule
+Item & Grid \\
+\midrule
+Single thresholds ($\tau$ for B1, B3, B3b, B5, B7, VES and variants) & Dev quantiles of the score at
+      5\% steps, plus $\pm\infty$ \\
+ECS thresholds $(\tau_{\mathrm{keep}}, \tau_{\mathrm{sw}}, \tau_D)$ & Each over dev quantiles at 5\% steps
+      plus $\pm\infty$, searched jointly (offline) \\
+VES & $\ell_s \in \{50\%, 60\%\}$, $\alpha \in \{0.1, 0.2, 0.4\}$, $K = 3$ \\
+VES-free & $\alpha \in \{0.1, 0.2, 0.4\}$ at VES's $\ell_s$ \\
+ECS & $a \in \{50\%, 60\%, 75\%\}$ by the agreement rule; $\beta \in \{0.5, 1, 2\}$; $k = 3$ \\
+B5 & $N \in \{1, 2, 4, 8\}$ and $N_{\mathrm{matched}}$ \\
+Ridge strength & SQ2 grid (relative values 0.001 to 100) \\
+Seeds & Global seed 0; tries seeded by (model, qid, try) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%======================================================================
+\section{Per-question record (JSONL)}
+%======================================================================
+\begin{verbatim}
+qid, source, relation, subj_id, obj_id, split, model,
+A1:      {text, label_strict, label_sq2, first_token, is_idk, m,
+          sD, sD_before, sD_after},
+tries:   [{idx, text, label_strict, sD (tries 11-18 only)}],
+strata:  {confident_error, disagreement},
+search:  {VES|VES_free|VES_placebo|B7: [{k, text, label_strict, status,
+          sD_clean, sD_steered (VES only), fpe}]},
+ecs:     {top_a, C: [c1, c2, c3], first_token_A1,
+          E_1p: {c: score}, E_exact: {c: score}, E_placebo: {c: score},
+          completion: {c: {text, label_strict, sD}}}
+\end{verbatim}
+Method outputs are not stored per question; they are recomputed offline from these records and the frozen
+thresholds.
+
+\end{document}
